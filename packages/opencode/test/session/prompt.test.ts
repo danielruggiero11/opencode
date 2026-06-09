@@ -6,7 +6,15 @@ import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { FetchHttpClient } from "effect/unstable/http"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Sink, Stream } from "effect"
+import * as PlatformError from "effect/PlatformError"
+import {
+  ChildProcessSpawner,
+  ExitCode,
+  make as makeSpawner,
+  makeHandle,
+  ProcessId,
+} from "effect/unstable/process/ChildProcessSpawner"
 import path from "path"
 import { fileURLToPath, pathToFileURL } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -157,8 +165,6 @@ const lsp = Layer.succeed(
 
 const status = SessionStatus.layer.pipe(Layer.provideMerge(EventV2Bridge.defaultLayer))
 const run = SessionRunState.layer.pipe(Layer.provide(status))
-const infra = Layer.mergeAll(NodeFileSystem.layer, CrossSpawnSpawner.defaultLayer)
-
 const processorCreateStarted: Array<() => void> = []
 const blockingProcessor = Layer.succeed(
   SessionProcessor.Service,
@@ -167,7 +173,8 @@ const blockingProcessor = Layer.succeed(
   }),
 )
 
-function makePrompt(input?: { processor?: "blocking" }) {
+function makePrompt(input?: { processor?: "blocking"; spawner?: Layer.Layer<ChildProcessSpawner> }) {
+  const infra = Layer.mergeAll(NodeFileSystem.layer, input?.spawner ?? CrossSpawnSpawner.defaultLayer)
   const deps = Layer.mergeAll(
     Session.defaultLayer,
     Snapshot.defaultLayer,
@@ -236,17 +243,39 @@ function makePrompt(input?: { processor?: "blocking" }) {
   )
 }
 
-function makeHttp(input?: { processor?: "blocking" }) {
+function makeHttp(input?: { processor?: "blocking"; spawner?: Layer.Layer<ChildProcessSpawner> }) {
   return Layer.mergeAll(TestLLMServer.layer, makePrompt(input))
 }
 
-function makeHttpNoLLMServer(input?: { processor?: "blocking" }) {
+function makeHttpNoLLMServer(input?: { processor?: "blocking"; spawner?: Layer.Layer<ChildProcessSpawner> }) {
   return makePrompt(input)
 }
 
 const it = testEffect(makeHttp())
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const streamError = PlatformError.systemError({ _tag: "Unknown", module: "ChildProcess", method: "stdout" })
+const failingHandle = makeHandle({
+  pid: ProcessId(1),
+  stdin: Sink.drain,
+  stdout: Stream.fail(streamError),
+  stderr: Stream.empty,
+  all: Stream.fail(streamError),
+  getInputFd: () => Sink.drain,
+  getOutputFd: () => Stream.empty,
+  isRunning: Effect.succeed(false),
+  exitCode: Effect.succeed(ExitCode(0)),
+  kill: () => Effect.void,
+  unref: Effect.succeed(Effect.void),
+})
+const failingShell = testEffect(
+  makeHttpNoLLMServer({
+    spawner: Layer.succeed(
+      ChildProcessSpawner,
+      makeSpawner(() => Effect.succeed(failingHandle)),
+    ),
+  }),
+)
 const unix = process.platform !== "win32" ? it.instance : it.instance.skip
 const unixNoLLMServer = process.platform !== "win32" ? noLLMServer.instance : noLLMServer.instance.skip
 
@@ -1643,6 +1672,21 @@ unixNoLLMServer(
   30_000,
 )
 
+failingShell.instance(
+  "legacy shell persists error when output draining fails",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, sessions, chat } = yield* boot()
+      const exit = yield* prompt.shell({ sessionID: chat.id, agent: "build", command: "ignored" }).pipe(Effect.exit)
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const tool = messages.flatMap((message) => message.parts).find((part) => part.type === "tool")
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(tool?.state.status).toBe("error")
+    }),
+  { config: cfg },
+)
+
 unixNoLLMServer(
   "cancel persists aborted shell result when shell ignores TERM",
   () =>
@@ -1742,6 +1786,35 @@ unix(
     }),
   { git: true },
   30_000,
+)
+
+unix(
+  "bash tool settles when a descendant inherits stdout",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "run" }],
+      })
+      yield* llm.tool("bash", {
+        command: "sleep 30 & printf done",
+        description: "background",
+        timeout: 30_000,
+        workdir: dir,
+      })
+      yield* llm.text("continued")
+
+      const result = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.timeout("3 seconds"))
+      expect(result.parts.some((part) => part.type === "text" && part.text === "continued")).toBe(true)
+    }),
+  { git: true },
+  8_000,
 )
 
 unixNoLLMServer(

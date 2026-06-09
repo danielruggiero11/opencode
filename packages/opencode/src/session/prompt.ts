@@ -23,6 +23,7 @@ import { LSP } from "@/lsp/lsp"
 import { ulid } from "ulid"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ProcessOutput } from "@opencode-ai/core/process-output"
 import * as Stream from "effect/Stream"
 import { Command } from "../command"
 import { pathToFileURL, fileURLToPath } from "url"
@@ -563,38 +564,48 @@ export const layer = Layer.effect(
           const args = Shell.args(sh, input.command, cwd)
           let output = ""
           let aborted = false
+          let acceptingOutput = true
 
-          const finish = Effect.uninterruptible(
-            Effect.gen(function* () {
-              if (aborted) {
-                output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
-              }
-              const completed = Date.now()
-              if (flags.experimentalEventSystem) {
-                yield* events.publish(SessionEvent.Shell.Ended, {
-                  sessionID: input.sessionID,
-                  timestamp: DateTime.makeUnsafe(completed),
-                  callID: part.callID,
-                  output,
-                })
-              }
-              if (!msg.time.completed) {
-                msg.time.completed = completed
-                yield* sessions.updateMessage(msg)
-              }
-              if (part.state.status === "running") {
-                part.state = {
-                  status: "completed",
-                  time: { ...part.state.time, end: completed },
-                  input: part.state.input,
-                  title: "",
-                  metadata: { output, description: "" },
-                  output,
+          const finish = (error?: string) =>
+            Effect.uninterruptible(
+              Effect.gen(function* () {
+                if (aborted) {
+                  output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
                 }
-                yield* sessions.updatePart(part)
-              }
-            }),
-          )
+                const completed = Date.now()
+                if (flags.experimentalEventSystem) {
+                  yield* events.publish(SessionEvent.Shell.Ended, {
+                    sessionID: input.sessionID,
+                    timestamp: DateTime.makeUnsafe(completed),
+                    callID: part.callID,
+                    output,
+                  })
+                }
+                if (!msg.time.completed) {
+                  msg.time.completed = completed
+                  yield* sessions.updateMessage(msg)
+                }
+                if (part.state.status === "running") {
+                  part.state = error
+                    ? {
+                        status: "error",
+                        error,
+                        time: { ...part.state.time, end: completed },
+                        input: part.state.input,
+                        metadata: { output, description: "" },
+                      }
+                    : {
+                        status: "completed",
+                        time: { ...part.state.time, end: completed },
+                        input: part.state.input,
+                        title: "",
+                        metadata: { output, description: "" },
+                        output,
+                      }
+                  yield* sessions.updatePart(part)
+                }
+              }),
+            )
 
           const exit = yield* restore(
             Effect.gen(function* () {
@@ -611,27 +622,39 @@ export const layer = Layer.effect(
                 forceKillAfter: "3 seconds",
               })
               const handle = yield* spawner.spawn(cmd)
-              yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
-                Effect.gen(function* () {
-                  output += chunk
-                  if (part.state.status === "running") {
-                    part.state.metadata = { output, description: "" }
-                    yield* sessions.updatePart(part)
-                  }
-                }),
-              )
-              yield* handle.exitCode
+              yield* ProcessOutput.drain(
+                handle,
+                [
+                  Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+                    Effect.gen(function* () {
+                      if (!acceptingOutput) return
+                      output += chunk
+                      if (part.state.status === "running") {
+                        part.state.metadata = { output, description: "" }
+                        yield* sessions.updatePart(part)
+                      }
+                    }),
+                  ),
+                ],
+                {
+                  grace: "250 millis",
+                  onClose: () => {
+                    acceptingOutput = false
+                  },
+                },
+              ).pipe(Effect.asVoid)
             }).pipe(Effect.scoped, Effect.orDie),
           ).pipe(Effect.exit)
 
           if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause) && !Cause.hasDies(exit.cause)) {
             aborted = true
           }
-          yield* finish
+          const failure =
+            Exit.isFailure(exit) && !aborted && !Cause.hasInterruptsOnly(exit.cause) ? exit.cause : undefined
+          const error = failure && Cause.squash(failure)
+          yield* finish(error instanceof Error ? error.message : error ? String(error) : undefined)
 
-          if (Exit.isFailure(exit) && !aborted && !Cause.hasInterruptsOnly(exit.cause)) {
-            return yield* Effect.failCause(exit.cause)
-          }
+          if (failure) return yield* Effect.failCause(failure)
 
           return { info: msg, parts: [part] }
         }),

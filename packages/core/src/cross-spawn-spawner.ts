@@ -24,6 +24,7 @@ import {
 import * as NodeChildProcess from "node:child_process"
 import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
+import { ProcessOutput } from "./process-output"
 
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
 
@@ -266,18 +267,11 @@ export const make = Effect.gen(function* () {
     Effect.callback<readonly [NodeChildProcess.ChildProcess, ExitSignal], PlatformError.PlatformError>((resume) => {
       const signal = Deferred.makeUnsafe<readonly [code: number | null, signal: NodeJS.Signals | null]>()
       const proc = launch(command.command, command.args, opts)
-      let end = false
-      let exit: readonly [code: number | null, signal: NodeJS.Signals | null] | undefined
       proc.on("error", (err) => {
         resume(Effect.fail(toPlatformError("spawn", err, command)))
       })
       proc.on("exit", (...args) => {
-        exit = args
-      })
-      proc.on("close", (...args) => {
-        if (end) return
-        end = true
-        Deferred.doneUnsafe(signal, Exit.succeed(exit ?? args))
+        Deferred.doneUnsafe(signal, Exit.succeed(args))
       })
       proc.on("spawn", () => {
         resume(Effect.succeed([proc, signal]))
@@ -340,6 +334,16 @@ export const make = Effect.gen(function* () {
       })
     }
 
+  const groupAlive = (proc: NodeChildProcess.ChildProcess) => {
+    if (process.platform === "win32") return false
+    try {
+      process.kill(-proc.pid!, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   const source = (handle: ChildProcessHandle, from: ChildProcess.PipeFromOption | undefined) => {
     const opt = from ?? "stdout"
     switch (opt) {
@@ -381,9 +385,11 @@ export const make = Effect.gen(function* () {
               const done = yield* Deferred.isDone(signal)
               const kill = timeout(proc, command, command.options)
               if (done) {
-                const [code] = yield* Deferred.await(signal)
                 if (process.platform === "win32") return yield* Effect.void
-                if (code !== 0 && Predicate.isNotNull(code)) return yield* Effect.ignore(kill(killGroup))
+                if (!groupAlive(proc)) return yield* Effect.void
+                yield* Effect.ignore(killGroup(command, proc, command.options.killSignal ?? "SIGTERM"))
+                yield* Effect.sleep("100 millis")
+                if (groupAlive(proc)) yield* Effect.ignore(killGroup(command, proc, "SIGKILL"))
                 return yield* Effect.void
               }
               const send = (s: NodeJS.Signals) =>
@@ -403,7 +409,7 @@ export const make = Effect.gen(function* () {
           const fd = yield* setupFds(command, proc, extra)
           const out = setupOutput(command, proc, sout, serr)
           let ref = true
-          return makeHandle({
+          const handle = makeHandle({
             pid: ProcessId(proc.pid!),
             stdin: yield* setupStdin(command, proc, sin),
             stdout: out.stdout,
@@ -446,6 +452,8 @@ export const make = Effect.gen(function* () {
               })
             }),
           })
+          ProcessOutput.register(handle, proc)
+          return handle
         }
         case "PipedCommand": {
           const flat = flatten(command)

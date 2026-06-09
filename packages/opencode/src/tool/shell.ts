@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Effect, Fiber, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -20,6 +20,7 @@ import * as Truncate from "./truncate"
 import { Plugin } from "@/plugin"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+import { ProcessOutput } from "@opencode-ai/core/process-output"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
 
@@ -456,6 +457,7 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      let acceptingOutput = true
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -494,54 +496,59 @@ export const ShellTool = Tool.define(
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
-          yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
+          const output = Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+            if (!acceptingOutput) return Effect.void
+            const size = Buffer.byteLength(chunk, "utf-8")
+            list.push({ text: chunk, size })
+            used += size
+            while (used > keep && list.length > 1) {
+              const item = list.shift()
+              if (!item) break
+              used -= item.size
+              cut = true
+            }
+
+            last = preview(last + chunk)
+
+            if (file) {
+              sink?.write(chunk)
+            } else {
+              full += chunk
+              if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
+                return trunc.write(full).pipe(
+                  Effect.andThen((next) =>
+                    Effect.sync(() => {
+                      file = next
+                      cut = true
+                      sink = createWriteStream(next, { flags: "a" })
+                      full = ""
+                    }),
+                  ),
+                  Effect.andThen(
+                    ctx.metadata({
+                      metadata: {
+                        output: last,
+                        description: input.description,
+                      },
+                    }),
+                  ),
+                )
               }
+            }
 
-              last = preview(last + chunk)
-
-              if (file) {
-                sink?.write(chunk)
-              } else {
-                full += chunk
-                if (Buffer.byteLength(full, "utf-8") > limits.maxBytes) {
-                  return trunc.write(full).pipe(
-                    Effect.andThen((next) =>
-                      Effect.sync(() => {
-                        file = next
-                        cut = true
-                        sink = createWriteStream(next, { flags: "a" })
-                        full = ""
-                      }),
-                    ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                          description: input.description,
-                        },
-                      }),
-                    ),
-                  )
-                }
-              }
-
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                  description: input.description,
-                },
-              })
-            }),
-          )
+            return ctx.metadata({
+              metadata: {
+                output: last,
+                description: input.description,
+              },
+            })
+          })
+          const drained = yield* ProcessOutput.drain(handle, [output], {
+            grace: "1500 millis",
+            onClose: () => {
+              acceptingOutput = false
+            },
+          }).pipe(Effect.forkScoped)
 
           const abort = Effect.callback<void>((resume) => {
             if (ctx.abort.aborted) return resume(Effect.void)
@@ -552,8 +559,8 @@ export const ShellTool = Tool.define(
 
           const timeout = Effect.sleep(`${input.timeout + 100} millis`)
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+          const exit = yield* Effect.raceAllFirst([
+            Fiber.join(drained).pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
             abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
             timeout.pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
           ])
@@ -566,6 +573,7 @@ export const ShellTool = Tool.define(
             expired = true
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
+          if (exit.kind !== "exit") yield* Fiber.await(drained)
 
           return exit.kind === "exit" ? exit.code : null
         }),

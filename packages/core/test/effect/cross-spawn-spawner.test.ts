@@ -6,6 +6,7 @@ import { Effect, Exit, Stream } from "effect"
 import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { ProcessOutput } from "@opencode-ai/core/process-output"
 import { testEffect } from "../lib/effect"
 
 const live = CrossSpawnSpawner.defaultLayer
@@ -95,6 +96,28 @@ describe("cross-spawn spawner", () => {
         const code = yield* handle.exitCode
         expect(code).toBe(ChildProcessSpawner.ExitCode(42))
       }),
+    )
+
+    fx.live(
+      "reports direct exit while a descendant holds stdout open",
+      Effect.gen(function* () {
+        if (process.platform === "win32") return
+        const handle = yield* ChildProcess.make("sh", ["-c", "sleep 30 &"])
+        expect(yield* handle.exitCode.pipe(Effect.timeout("1 second"))).toBe(ChildProcessSpawner.ExitCode(0))
+      }),
+    )
+
+    fx.live(
+      "terminates the process when an owned drain fails before exit",
+      Effect.gen(function* () {
+        const handle = yield* js("setInterval(() => {}, 10_000)")
+        const pid = Number(handle.pid)
+        const exit = yield* ProcessOutput.drain(handle, [Effect.fail("drain failed")]).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(yield* Effect.promise(() => gone(pid))).toBe(true)
+      }),
+      5_000,
     )
   })
 

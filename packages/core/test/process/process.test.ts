@@ -25,6 +25,19 @@ const waitForFile = (file: string) =>
     }
   })
 
+const gone = (pid: number) =>
+  Effect.promise(async () => {
+    for (let i = 0; i < 200; i++) {
+      try {
+        process.kill(pid, 0)
+      } catch {
+        return true
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25))
+    }
+    return false
+  })
+
 describe("AppProcess", () => {
   describe("run", () => {
     it.effect(
@@ -134,6 +147,22 @@ describe("AppProcess", () => {
     )
 
     if (process.platform !== "win32") {
+      it.live(
+        "captures large output and cleans a descendant holding stdout open",
+        Effect.gen(function* () {
+          const svc = yield* AppProcess.Service
+          const size = 8 * 1024 * 1024
+          const command = `sleep 30 & child=$!; printf "%s\\n" "$child"; dd if=/dev/zero bs=${size} count=1 2>/dev/null | tr '\\0' x`
+          const result = yield* svc.run(ChildProcess.make("sh", ["-c", command]))
+          const newline = result.stdout.indexOf(10)
+          const pid = Number(result.stdout.subarray(0, newline).toString("utf8"))
+
+          expect(result.stdout.length).toBe(newline + 1 + size)
+          expect(yield* gone(pid)).toBe(true)
+        }),
+        8_000,
+      )
+
       it.live(
         "timeout cleans up the scoped child process",
         Effect.acquireUseRelease(

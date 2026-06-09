@@ -27,6 +27,7 @@ target
 .direnv/
 
 # Local dev files
+CLAUDE.md
 opencode-dev
 UPCOMING_CHANGELOG.md
 logs/

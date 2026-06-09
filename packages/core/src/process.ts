@@ -3,6 +3,7 @@ import type { PlatformError } from "effect/PlatformError"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { CrossSpawnSpawner } from "./cross-spawn-spawner"
+import { ProcessOutput } from "./process-output"
 
 export class AppProcessError extends Schema.TaggedErrorClass<AppProcessError>()("AppProcessError", {
   command: Schema.String,
@@ -125,6 +126,19 @@ export const collectStream = (stream: Stream.Stream<Uint8Array, PlatformError>, 
     },
   ).pipe(Effect.map((x) => ({ buffer: Buffer.concat(x.chunks), truncated: x.truncated })))
 
+const collector = (stream: Stream.Stream<Uint8Array, PlatformError>, maxBytes: number | undefined) => {
+  const state = { chunks: [] as Uint8Array[], bytes: 0, truncated: false }
+  const drain = Stream.runForEach(stream, (chunk) =>
+    Effect.sync(() => {
+      const remaining = maxBytes === undefined ? chunk.length : maxBytes - state.bytes
+      if (remaining > 0) state.chunks.push(remaining >= chunk.length ? chunk : chunk.slice(0, remaining))
+      state.bytes += chunk.length
+      state.truncated = maxBytes !== undefined && state.bytes > maxBytes
+    }),
+  )
+  return { drain, result: () => ({ buffer: Buffer.concat(state.chunks), truncated: state.truncated }) }
+}
+
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -135,21 +149,18 @@ export const layer = Layer.effect(
       const collect = Effect.scoped(
         Effect.gen(function* () {
           const handle = yield* spawner.spawn(command)
-          const [stdout, stderr, exitCode] = yield* Effect.all(
-            [
-              collectStream(handle.stdout, options?.maxOutputBytes),
-              collectStream(handle.stderr, options?.maxErrorBytes),
-              handle.exitCode,
-            ],
-            { concurrency: "unbounded" },
-          )
+          const stdout = collector(handle.stdout, options?.maxOutputBytes)
+          const stderr = collector(handle.stderr, options?.maxErrorBytes)
+          const exitCode = yield* ProcessOutput.drain(handle, [stdout.drain, stderr.drain])
+          const out = stdout.result()
+          const err = stderr.result()
           return {
             command: description,
             exitCode,
-            stdout: stdout.buffer,
-            stderr: stderr.buffer,
-            stdoutTruncated: stdout.truncated,
-            stderrTruncated: stderr.truncated,
+            stdout: out.buffer,
+            stderr: err.buffer,
+            stdoutTruncated: out.truncated,
+            stderrTruncated: err.truncated,
           } satisfies RunResult
         }),
       )
