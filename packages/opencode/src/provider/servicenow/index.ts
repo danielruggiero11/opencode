@@ -1,12 +1,14 @@
-import type {
-  JSONObject,
-  LanguageModelV3,
-  LanguageModelV3CallOptions,
-  LanguageModelV3Content,
-  LanguageModelV3StreamPart,
-  SharedV3ProviderMetadata,
-  SharedV3Warning,
+import {
+  APICallError,
+  type JSONObject,
+  type LanguageModelV3,
+  type LanguageModelV3CallOptions,
+  type LanguageModelV3Content,
+  type LanguageModelV3StreamPart,
+  type SharedV3ProviderMetadata,
+  type SharedV3Warning,
 } from "@ai-sdk/provider"
+import { countTokens } from "./tokenizer"
 
 export interface ServiceNowConfig {
   readonly instanceURL: string
@@ -184,55 +186,81 @@ ${JSON.stringify(defs, null, 2)}
     const { instanceURL, username, password, capabilityId } = this.config
     const fetchFn = this.config.fetch ?? globalThis.fetch
     const credentials = Buffer.from(`${username}:${password}`).toString("base64")
+    const maxAttempts = 3
 
-    const res = await fetchFn(`${instanceURL}/api/now/oneextend/scripted/setup_and_execute`, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${credentials}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        mode: "sync",
-        executionRequests: [{ capabilityId, payload: { userprompt: prompt } }],
-      }),
-      signal,
-    })
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const res = await fetchFn(`${instanceURL}/api/now/oneextend/scripted/setup_and_execute`, {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${credentials}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          mode: "sync",
+          executionRequests: [{ capabilityId, payload: { userprompt: prompt } }],
+        }),
+        signal,
+      })
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => "")
-      throw new Error(`ServiceNow API ${res.status}: ${body.slice(0, 500)}`)
+      if (!res.ok) {
+        const body = await res.text().catch(() => "")
+        throw new Error(`ServiceNow API ${res.status}: ${body.slice(0, 500)}`)
+      }
+
+      const data = (await res.json()) as Record<string, unknown>
+      const result = (data?.result as Record<string, unknown> | undefined) ?? {}
+      const capabilities = (result.capabilities as Record<string, unknown> | undefined) ?? {}
+      const cap = capabilities[capabilityId] as Record<string, unknown> | undefined
+
+      if (!cap || cap.status !== "success") {
+        const capJson = JSON.stringify(cap ?? {})
+        const capError = typeof cap?.error === "string" ? cap.error : capJson
+
+        // Context overflow: input data exceeds provider limit — do not retry
+        if (capError.includes("exceeds limit") || capError.includes("DATA_PRIVACY_API_ERROR")) {
+          throw new APICallError({
+            message: `ServiceNow context overflow: ${capError}`,
+            url: `${instanceURL}/api/now/oneextend/scripted/setup_and_execute`,
+            requestBodyValues: { capabilityId },
+            statusCode: 413,
+            responseBody: capJson,
+            isRetryable: false,
+          })
+        }
+
+        // Retry on transient skill status failures (e.g. status: unknown)
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 1000 + attempt * 500))
+          continue
+        }
+        throw new Error(
+          `ServiceNow skill status: ${String(cap?.status ?? "unknown")} (after ${maxAttempts} attempts) — ${capJson}`,
+        )
+      }
+
+      const rawResponse = cap.response
+      const text =
+        typeof rawResponse === "string"
+          ? rawResponse
+          : Array.isArray(rawResponse) && typeof rawResponse[0] === "string"
+            ? rawResponse[0]
+            : rawResponse != null
+              ? JSON.stringify(rawResponse)
+              : ""
+      if (!text) {
+        throw new Error(
+          `ServiceNow returned empty response for capability ${capabilityId} — full cap: ${JSON.stringify(cap)}`,
+        )
+      }
+
+      return {
+        text,
+        thinking: (cap.thinking_response as string | undefined) ?? undefined,
+      }
     }
 
-    const data = (await res.json()) as Record<string, unknown>
-    const result = (data?.result as Record<string, unknown> | undefined) ?? {}
-    const capabilities = (result.capabilities as Record<string, unknown> | undefined) ?? {}
-    const cap = capabilities[capabilityId] as Record<string, unknown> | undefined
-
-    if (!cap || cap.status !== "success") {
-      throw new Error(
-        `ServiceNow skill status: ${String(cap?.status ?? "unknown")} — ${JSON.stringify(cap ?? {})}`,
-      )
-    }
-
-    const rawResponse = cap.response
-    const text =
-      typeof rawResponse === "string"
-        ? rawResponse
-        : Array.isArray(rawResponse) && typeof rawResponse[0] === "string"
-          ? rawResponse[0]
-          : rawResponse != null
-            ? JSON.stringify(rawResponse)
-            : ""
-    if (!text) {
-      throw new Error(
-        `ServiceNow returned empty response for capability ${capabilityId} — full cap: ${JSON.stringify(cap)}`,
-      )
-    }
-
-    return {
-      text,
-      thinking: (cap.thinking_response as string | undefined) ?? undefined,
-    }
+    // Unreachable — the loop always returns or throws on the final attempt
+    throw new Error("ServiceNow callAPI: exhausted retries")
   }
 
   // ---------------------------------------------------------------------------
@@ -323,8 +351,8 @@ ${JSON.stringify(defs, null, 2)}
     content: LanguageModelV3Content[]
     finishReason: { unified: "stop" | "tool-calls"; raw: string }
     usage: {
-      inputTokens: { total: undefined; noCache: undefined; cacheRead: undefined; cacheWrite: undefined }
-      outputTokens: { total: undefined; text: undefined; reasoning: undefined }
+      inputTokens: { total: number | undefined; noCache: number | undefined; cacheRead: undefined; cacheWrite: undefined }
+      outputTokens: { total: number | undefined; text: number | undefined; reasoning: number | undefined }
       raw: undefined
     }
     providerMetadata: SharedV3ProviderMetadata
@@ -336,11 +364,17 @@ ${JSON.stringify(defs, null, 2)}
     const { text, thinking } = await this.callAPI(prompt, options.abortSignal)
     const parsed = this.parseResponse(text, thinking)
 
+    // Estimate token usage since the ServiceNow API does not return counts
+    const inputTokens = countTokens(prompt)
+    const reasoningTokens = thinking ? countTokens(thinking) : 0
+
     const content: LanguageModelV3Content[] = []
+    let outputTokens = 0
 
     if (parsed.thinking) content.push({ type: "reasoning", text: parsed.thinking })
 
     if (parsed.type === "tool_calls") {
+      outputTokens = countTokens(parsed.calls.map((c) => c.input).join(""))
       for (const call of parsed.calls) {
         content.push({
           type: "tool-call",
@@ -350,6 +384,7 @@ ${JSON.stringify(defs, null, 2)}
         })
       }
     } else {
+      outputTokens = countTokens(parsed.text)
       content.push({ type: "text", text: parsed.text })
     }
 
@@ -360,8 +395,8 @@ ${JSON.stringify(defs, null, 2)}
         raw: parsed.type === "tool_calls" ? "tool_use" : "end_turn",
       },
       usage: {
-        inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
-        outputTokens: { total: undefined, text: undefined, reasoning: undefined },
+        inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: undefined, cacheWrite: undefined },
+        outputTokens: { total: outputTokens + reasoningTokens, text: outputTokens, reasoning: reasoningTokens },
         raw: undefined,
       },
       providerMetadata: { servicenow: {} as JSONObject },
@@ -384,6 +419,13 @@ ${JSON.stringify(defs, null, 2)}
     const { text, thinking } = await this.callAPI(prompt, options.abortSignal)
     const parsed = this.parseResponse(text, thinking)
     const warnings: SharedV3Warning[] = []
+
+    // Estimate token usage since the ServiceNow API does not return counts
+    const inputTokens = countTokens(prompt)
+    const outputTokens = parsed.type === "tool_calls"
+      ? countTokens(parsed.calls.map((c) => c.input).join(""))
+      : countTokens(parsed.text)
+    const reasoningTokens = thinking ? countTokens(thinking) : 0
 
     const stream = new ReadableStream<LanguageModelV3StreamPart>({
       start(controller) {
@@ -428,8 +470,8 @@ ${JSON.stringify(defs, null, 2)}
             raw: parsed.type === "tool_calls" ? "tool_use" : "end_turn",
           },
           usage: {
-            inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
-            outputTokens: { total: undefined, text: undefined, reasoning: undefined },
+            inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: undefined, cacheWrite: undefined },
+            outputTokens: { total: outputTokens + reasoningTokens, text: outputTokens, reasoning: reasoningTokens },
             raw: undefined,
           },
           providerMetadata: { servicenow: {} as JSONObject },
