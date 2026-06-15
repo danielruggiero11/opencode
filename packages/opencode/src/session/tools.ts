@@ -75,11 +75,22 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         .pipe(Effect.orDie),
   })
 
+  // [LUMEN PATCH — see /CLAUDE.md "Custom Core Patches"] Drop tools whose session
+  // permission resolves to "deny" from the list ADVERTISED to the model. Upstream only
+  // consults permission at execute time (the `ask` below), so a denied tool is still
+  // shown and the model can still pick it. Filtering it out here lets a per-request
+  // `tools:{name:false}` map actually shrink the model's tool surface (Lumen uses this to
+  // send weaker shim models — e.g. GPT-5 — only the tools they need). Opt-in: with no deny
+  // rule a tool evaluates to "ask"/default and is kept, so default behavior is unchanged.
+  const advertiseRuleset = Permission.merge(input.agent.permission, input.session.permission ?? [])
+  const isDenied = (name: string) => Permission.evaluate(name, "*", advertiseRuleset).action === "deny"
+
   for (const item of yield* registry.tools({
     modelID: ModelV2.ID.make(input.model.api.id),
     providerID: input.model.providerID,
     agent: input.agent,
   })) {
+    if (isDenied(item.id)) continue
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
     tools[item.id] = tool({
       description: item.description,
@@ -121,6 +132,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   for (const [key, item] of Object.entries(yield* mcp.tools())) {
     const execute = item.execute
     if (!execute) continue
+    if (isDenied(key)) continue // [LUMEN PATCH] same advertise-time deny filter for MCP tools
 
     const schema = yield* Effect.promise(() => Promise.resolve(asSchema(item.inputSchema).jsonSchema))
     const transformed = ProviderTransform.schema(input.model, schema)

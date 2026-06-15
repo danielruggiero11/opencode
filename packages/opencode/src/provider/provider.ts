@@ -134,6 +134,8 @@ const BUNDLED_PROVIDERS: Record<string, () => Promise<(opts: any) => BundledSDK>
   "venice-ai-sdk-provider": () => import("venice-ai-sdk-provider").then((m) => m.createVenice),
   "@opencode-ai/servicenow-provider": () =>
     import("./servicenow/index.js").then((m) => m.createServiceNow),
+  "@opencode-ai/powerautomate-provider": () =>
+    import("./powerautomate/index.js").then((m) => m.createPowerAutomate),
 }
 
 type CustomModelLoader = (sdk: any, modelID: string, options?: Record<string, any>, model?: Model) => Promise<any>
