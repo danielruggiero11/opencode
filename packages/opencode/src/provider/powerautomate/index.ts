@@ -13,7 +13,22 @@ export interface PowerAutomateConfig {
   // JSON field to read the answer from when the flow returns a JSON object.
   // When unset, the raw response body is used as the text (plaintext flows).
   readonly responseField?: string
+  // Per-device authorization secret sent as the `x-lumen-secret` header. The
+  // flow rejects calls whose secret isn't a known, active one (otherwise the
+  // signed trigger URL would be an open, unauthenticated LLM endpoint). When
+  // unset here it falls back to the POWERAUTOMATE_SECRET env var at call time —
+  // so opencode works standalone (export the var) and Lumen-driven (Lumen
+  // injects it when launching `opencode serve`). See LumenPowerPages/docs.
+  readonly secret?: string
   readonly fetch?: typeof globalThis.fetch
+}
+
+// Resolve the device secret: explicit config wins, else the env var (read at
+// call time so a secret minted after process start is still picked up).
+function resolveSecret(config: PowerAutomateConfig): string | undefined {
+  if (config.secret) return config.secret
+  const fromEnv = process.env["POWERAUTOMATE_SECRET"]
+  return fromEnv && fromEnv.trim() ? fromEnv : undefined
 }
 
 // Builds the transport that performs the Power Automate flow call. Everything
@@ -31,13 +46,19 @@ function createTransport(config: PowerAutomateConfig): ShimTransport {
     if (sendModelInBody) body.model = modelId
     const requestBody = JSON.stringify(body)
 
+    // Authorization secret — resolved per request so a secret set after the
+    // process started (e.g. just-completed Lumen onboarding) is honored.
+    const secret = resolveSecret(config)
+    const headers: Record<string, string> = { "Content-Type": "application/json" }
+    if (secret) headers["x-lumen-secret"] = secret
+
     let lastError: unknown
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       let res: Response
       try {
         res = await fetchFn(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: requestBody,
           signal,
         })
@@ -122,6 +143,7 @@ export function createPowerAutomate(
     queryField?: unknown
     sendModelInBody?: unknown
     responseField?: unknown
+    secret?: unknown
     fetch?: unknown
   },
 ) {
@@ -130,6 +152,7 @@ export function createPowerAutomate(
     queryField: typeof opts.queryField === "string" && opts.queryField ? opts.queryField : "query",
     sendModelInBody: opts.sendModelInBody === true,
     responseField: typeof opts.responseField === "string" && opts.responseField ? opts.responseField : undefined,
+    secret: typeof opts.secret === "string" && opts.secret ? opts.secret : undefined,
     fetch: typeof opts.fetch === "function" ? (opts.fetch as typeof globalThis.fetch) : undefined,
   }
 
