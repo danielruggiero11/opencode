@@ -136,6 +136,8 @@ const BUNDLED_PROVIDERS: Record<string, () => Promise<(opts: any) => BundledSDK>
     import("./servicenow/index.js").then((m) => m.createServiceNow),
   "@opencode-ai/powerautomate-provider": () =>
     import("./powerautomate/index.js").then((m) => m.createPowerAutomate),
+  "@opencode-ai/cdp-provider": () =>
+    import("./cdp/index.js").then((m) => m.createCDP),
 }
 
 type CustomModelLoader = (sdk: any, modelID: string, options?: Record<string, any>, model?: Model) => Promise<any>

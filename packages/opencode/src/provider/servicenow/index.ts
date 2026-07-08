@@ -130,10 +130,7 @@ function createTransport(config: ServiceNowConfig): ShimTransport {
     // --- Attempt 2: constrained prompt (ask model to output less) ---
     const constrainedPrompt =
       prompt +
-      "\n\nHuman: Your previous response was too large and was dropped by the platform. " +
-      "You MUST dramatically reduce your output. Respond with ONLY your single next concrete action — " +
-      "no explanations, no alternatives, no summaries. Maximum 2000 words. " +
-      "If you were about to use a tool, output only the tool call JSON with no surrounding text."
+      "you are trying to do too much at once. you need to limit your output tokens and give me just the next action to take"
 
     await new Promise((r) => setTimeout(r, 3000))
     log.info("retrying with output constraint", { attempt: 2, promptLength: constrainedPrompt.length })
