@@ -11,43 +11,45 @@ export type ParsedResponse =
   | { readonly type: "text"; readonly text: string; readonly thinking?: string }
   | { readonly type: "tool_calls"; readonly calls: readonly ToolCall[]; readonly thinking?: string }
 
+// Attempts to parse a string as a single tool-call JSON object. Handles
+// markdown code fences and both canonical and GPT-5 variant formats.
+function trySingleToolCall(s: string): ToolCall | null {
+  // Strip markdown code fences e.g. ```json\n{...}\n```
+  const fenceMatch = s.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/)
+  const candidate = fenceMatch ? fenceMatch[1].trim() : s.trim()
+  try {
+    const parsed = JSON.parse(candidate) as Record<string, unknown>
+    // Canonical shape: {"type":"tool_call","name":"<tool>","id":"...","input":{...}}
+    if (
+      parsed.type === "tool_call" &&
+      typeof parsed.name === "string" &&
+      typeof parsed.id === "string"
+    ) {
+      return { name: parsed.name, id: parsed.id, input: JSON.stringify(parsed.input ?? {}) }
+    }
+    // [LUMEN PATCH — see /CLAUDE.md "Custom Core Patches"] GPT-5 (Power Automate) variant:
+    // {"type":"<toolName>","id":"...","input":{...}} — the tool name is in `type`, there is
+    // no canonical `name`. Upstream drops this as plain text so the call never fires. Accept
+    // a non-"tool_call" string `type` carrying an `input` field as the tool call.
+    if (
+      typeof parsed.type === "string" &&
+      parsed.type !== "tool_call" &&
+      typeof parsed.name !== "string" &&
+      "input" in parsed
+    ) {
+      const id = typeof parsed.id === "string" ? parsed.id : `call_${parsed.type}`
+      return { name: parsed.type, id, input: JSON.stringify(parsed.input ?? {}) }
+    }
+  } catch {
+    // not valid JSON
+  }
+  return null
+}
+
 export function parseResponse(raw: string, thinking?: string): ParsedResponse {
   // Defensive: ensure raw is always a string even if upstream typing is bypassed
   if (typeof raw !== "string") {
     raw = raw != null ? JSON.stringify(raw) : ""
-  }
-
-  const trySingleToolCall = (s: string): ToolCall | null => {
-    // Strip markdown code fences e.g. ```json\n{...}\n```
-    const fenceMatch = s.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/)
-    const candidate = fenceMatch ? fenceMatch[1].trim() : s.trim()
-    try {
-      const parsed = JSON.parse(candidate) as Record<string, unknown>
-      // Canonical shape: {"type":"tool_call","name":"<tool>","id":"...","input":{...}}
-      if (
-        parsed.type === "tool_call" &&
-        typeof parsed.name === "string" &&
-        typeof parsed.id === "string"
-      ) {
-        return { name: parsed.name, id: parsed.id, input: JSON.stringify(parsed.input ?? {}) }
-      }
-      // [LUMEN PATCH — see /CLAUDE.md "Custom Core Patches"] GPT-5 (Power Automate) variant:
-      // {"type":"<toolName>","id":"...","input":{...}} — the tool name is in `type`, there is
-      // no canonical `name`. Upstream drops this as plain text so the call never fires. Accept
-      // a non-"tool_call" string `type` carrying an `input` field as the tool call.
-      if (
-        typeof parsed.type === "string" &&
-        parsed.type !== "tool_call" &&
-        typeof parsed.name !== "string" &&
-        "input" in parsed
-      ) {
-        const id = typeof parsed.id === "string" ? parsed.id : `call_${parsed.type}`
-        return { name: parsed.type, id, input: JSON.stringify(parsed.input ?? {}) }
-      }
-    } catch {
-      // not valid JSON
-    }
-    return null
   }
 
   // Try the full response as a single tool call first
@@ -114,5 +116,72 @@ export function parseResponse(raw: string, thinking?: string): ParsedResponse {
   }
 
   if (calls.length > 0) return { type: "tool_calls", calls, thinking }
+
+  // Last-resort: scan for JSON tool calls embedded within non-JSON text. This
+  // handles cases where the model prefixes commentary on the same line as the
+  // tool call (e.g. "~ Updating... {\"type\":\"tool_call\",...}").
+  const embeddedCalls = extractEmbeddedToolCalls(raw)
+  if (embeddedCalls.length > 0) return { type: "tool_calls", calls: embeddedCalls, thinking }
+
   return { type: "text", text: raw, thinking }
+}
+
+// Scans the full text for JSON objects that look like tool calls but are
+// preceded by non-JSON preamble text. Uses indexOf to locate candidate start
+// positions and attempts to parse balanced JSON from each.
+function extractEmbeddedToolCalls(raw: string): ToolCall[] {
+  const calls: ToolCall[] = []
+  // Look for canonical and variant patterns anywhere in the text
+  const markers = ['{"type":"tool_call"', '{ "type": "tool_call"', '{"type":"']
+  for (const marker of markers) {
+    let searchFrom = 0
+    while (true) {
+      const idx = raw.indexOf(marker, searchFrom)
+      if (idx < 0) break
+      // Extract a balanced JSON object starting at idx
+      const jsonStr = extractBalancedJson(raw, idx)
+      if (jsonStr) {
+        const result = trySingleToolCall(jsonStr)
+        if (result) {
+          calls.push(result)
+          searchFrom = idx + jsonStr.length
+          continue
+        }
+      }
+      searchFrom = idx + 1
+    }
+    // If we found calls with this marker, don't try less specific ones
+    if (calls.length > 0) break
+  }
+  return calls
+}
+
+// Extracts a balanced JSON object starting at position `start` in `text`.
+// Returns the substring if it parses as valid JSON, otherwise null.
+function extractBalancedJson(text: string, start: number): string | null {
+  if (text[start] !== "{") return null
+  let depth = 0
+  let inString = false
+  let escape = false
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (escape) { escape = false; continue }
+    if (ch === "\\" && inString) { escape = true; continue }
+    if (ch === '"' && !escape) { inString = !inString; continue }
+    if (inString) continue
+    if (ch === "{") depth++
+    else if (ch === "}") {
+      depth--
+      if (depth === 0) {
+        const candidate = text.slice(start, i + 1)
+        try {
+          JSON.parse(candidate)
+          return candidate
+        } catch {
+          return null
+        }
+      }
+    }
+  }
+  return null
 }

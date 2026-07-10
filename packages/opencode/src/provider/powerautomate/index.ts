@@ -1,5 +1,6 @@
 import { APICallError, type LanguageModelV3 } from "@ai-sdk/provider"
 import { ShimLanguageModel, type ShimTransport } from "../shim/model"
+import { parseResponse } from "../shim/parse"
 
 export interface PowerAutomateConfig {
   // Full signed trigger URL — the `sig=` query parameter self-authenticates the
@@ -31,6 +32,50 @@ function resolveSecret(config: PowerAutomateConfig): string | undefined {
   return fromEnv && fromEnv.trim() ? fromEnv : undefined
 }
 
+// GPT-5 specific prompt suffix — reinforces tool-call formatting compliance.
+// Appended to every prompt sent through this transport. Does not affect the
+// shared shim or ServiceNow provider.
+const GPT5_TOOL_REINFORCEMENT = `
+
+<assistant_instructions>
+REMINDER — CRITICAL FORMATTING RULES:
+- When you decide to use a tool, your ENTIRE response must be ONLY the JSON object.
+- Do NOT write any text, commentary, narration, or status updates before or after the JSON.
+- Do NOT say things like "Let me...", "I'll...", "Updating...", "~ ...", or any preamble.
+- WRONG: "~ Updating todos...\n{"type":"tool_call",...}" 
+- WRONG: "I don't have enough information. {"type":"tool_call",...}"
+- CORRECT: {"type":"tool_call","name":"todowrite","id":"td_1","input":{...}}
+- If you cannot fulfill the request, just say so in plain text WITHOUT attempting a tool call.
+- If you CAN fulfill the request, output ONLY the tool call JSON with zero other text.
+</assistant_instructions>`
+
+// Detects whether a response text looks like a failed tool-call attempt — the
+// model tried to call a tool but wrapped it in commentary or produced the text
+// equivalent without proper JSON. Used to trigger a corrective retry.
+function looksLikeFailedToolCall(text: string): boolean {
+  // Must contain a literal fragment of tool-call JSON structure
+  if (!text.includes('"type"') && !text.includes('"tool_call"') && !text.includes('"input"')) return false
+  // But parseResponse didn't extract it as a tool call (caller checks this),
+  // so look for indicators that the model intended to call a tool:
+  // 1. Contains a partial JSON object with tool_call markers
+  if (text.includes('{"type":"tool_call"') || text.includes('{ "type": "tool_call"')) return true
+  // 2. Contains tool-call-like structure with type+input but surrounding text
+  if (text.includes('"input"') && (text.includes('"name"') || text.includes('"type"'))) {
+    // Only trigger if there's non-JSON text surrounding it (not just a standalone object)
+    const trimmed = text.trim()
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return true
+  }
+  return false
+}
+
+// Corrective prompt appended when retrying after a failed tool-call detection.
+const CORRECTIVE_RETRY_SUFFIX = `
+
+Human: Your previous response was not formatted correctly. You included text/commentary alongside or instead of the JSON tool call. Please try again. Output ONLY the raw JSON tool call object — nothing else. No text before it, no text after it, no markdown fences. Just the JSON:
+{"type":"tool_call","name":"<tool_name>","id":"<unique_id>","input":{...}}
+
+Assistant:`
+
 // Builds the transport that performs the Power Automate flow call. Everything
 // else (prompt serialization, tool-call parsing, streaming) is handled by the
 // shared shim base class.
@@ -39,16 +84,17 @@ function createTransport(config: PowerAutomateConfig): ShimTransport {
   const fetchFn = config.fetch ?? globalThis.fetch
   const maxAttempts = 3
 
-  return async ({ prompt, modelId, signal }) => {
+  // Core fetch logic — makes one HTTP call to the PA flow and returns the text.
+  async function callFlow(
+    prompt: string,
+    modelId: string,
+    signal: AbortSignal | undefined,
+    secret: string | undefined,
+  ): Promise<{ text: string; requestBody: string }> {
     const body: Record<string, unknown> = { [queryField]: prompt }
-    // Future model selection: the flow will read this field to choose a backend
-    // model. Gated by config so current single-model flows are unaffected.
     if (sendModelInBody) body.model = modelId
     const requestBody = JSON.stringify(body)
 
-    // Authorization secret — resolved per request so a secret set after the
-    // process started (e.g. just-completed Lumen onboarding) is honored.
-    const secret = resolveSecret(config)
     const headers: Record<string, string> = { "Content-Type": "application/json" }
     if (secret) headers["x-lumen-secret"] = secret
 
@@ -63,7 +109,6 @@ function createTransport(config: PowerAutomateConfig): ShimTransport {
           signal,
         })
       } catch (err) {
-        // Network/transport failure — retry transient errors
         lastError = err
         if (attempt < maxAttempts) {
           await new Promise((r) => setTimeout(r, 1000 + attempt * 500))
@@ -74,7 +119,6 @@ function createTransport(config: PowerAutomateConfig): ShimTransport {
 
       if (!res.ok) {
         const errBody = await res.text().catch(() => "")
-        // 4xx (bad request, expired/invalid sig) are not retryable; 5xx are.
         if (res.status >= 500 && attempt < maxAttempts) {
           lastError = new Error(`Power Automate API ${res.status}`)
           await new Promise((r) => setTimeout(r, 1000 + attempt * 500))
@@ -90,9 +134,6 @@ function createTransport(config: PowerAutomateConfig): ShimTransport {
         })
       }
 
-      // The flow returns plaintext (the model's answer, which may itself be a
-      // JSON tool-call that the shim parses). If a responseField is configured,
-      // or the body happens to be a JSON object, extract the field from it.
       const raw = await res.text()
       const text = extractText(raw, responseField)
       if (!text) {
@@ -103,6 +144,27 @@ function createTransport(config: PowerAutomateConfig): ShimTransport {
     }
 
     throw lastError instanceof Error ? lastError : new Error("Power Automate transport: exhausted retries")
+  }
+
+  return async ({ prompt, modelId, signal }) => {
+    // Append GPT-5 specific reinforcement to the prompt
+    const reinforcedPrompt = prompt + GPT5_TOOL_REINFORCEMENT
+
+    // Authorization secret — resolved per request
+    const secret = resolveSecret(config)
+
+    const result = await callFlow(reinforcedPrompt, modelId, signal, secret)
+
+    // Check if the response is a failed tool-call attempt. If so, retry once
+    // with a corrective prompt that tells the model to output only JSON.
+    const parsed = parseResponse(result.text)
+    if (parsed.type === "text" && looksLikeFailedToolCall(parsed.text)) {
+      const correctedPrompt = reinforcedPrompt + `\n\nAssistant: ${result.text}` + CORRECTIVE_RETRY_SUFFIX
+      const retryResult = await callFlow(correctedPrompt, modelId, signal, secret)
+      return retryResult
+    }
+
+    return result
   }
 }
 
