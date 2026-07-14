@@ -47,6 +47,7 @@ REMINDER — CRITICAL FORMATTING RULES:
 - CORRECT: {"type":"tool_call","name":"todowrite","id":"td_1","input":{...}}
 - If you cannot fulfill the request, just say so in plain text WITHOUT attempting a tool call.
 - If you CAN fulfill the request, output ONLY the tool call JSON with zero other text.
+- After a tool call succeeds, you will see the result in a "[Tool Results]" message. This is NOT a new user request — it is the output of the tool YOU just called. Respond by acknowledging what you accomplished based on the original user request. Do NOT say "I don't see a specific request" or ask what the user wants — you already know because YOU initiated the tool call.
 </assistant_instructions>`
 
 // Detects whether a response text looks like a failed tool-call attempt — the
@@ -147,20 +148,54 @@ function createTransport(config: PowerAutomateConfig): ShimTransport {
   }
 
   return async ({ prompt, modelId, signal }) => {
+    // Rewrite tool-result sections so GPT-5 understands them as continuations,
+    // not new user requests. The shared shim formats them as:
+    //   Human: [Tool Results]\n[toolName → OK]\n...
+    // GPT-5 interprets "Human:" as a new user message and loses context.
+    const rewrittenPrompt = prompt.replace(
+      /Human: \[Tool Results\]/g,
+      "Human: [System: Below is the output of the tool you just called. This is NOT a new user request. After reading the result, briefly confirm what you accomplished for the user based on their ORIGINAL request above.]\n[Tool Results]",
+    )
+
     // Append GPT-5 specific reinforcement to the prompt
-    const reinforcedPrompt = prompt + GPT5_TOOL_REINFORCEMENT
+    const reinforcedPrompt = rewrittenPrompt + GPT5_TOOL_REINFORCEMENT
+
+    // DEBUG: Write full prompt and response to temp file for inspection.
+    // Enable by setting OPENCODE_PA_DEBUG=1 in the environment.
+    const debugEnabled = process.env["OPENCODE_PA_DEBUG"] === "1"
+    const debugDir = process.env["TEMP"] || process.env["TMP"] || "/tmp"
+    const debugFile = `${debugDir}/opencode-pa-debug.log`
+
+    async function debugLog(label: string, content: string) {
+      if (!debugEnabled) return
+      const ts = new Date().toISOString()
+      const entry = `\n${'='.repeat(80)}\n[${ts}] ${label}\n${'='.repeat(80)}\n${content}\n`
+      try {
+        const { appendFile } = await import("fs/promises")
+        await appendFile(debugFile, entry)
+      } catch { /* ignore write errors */ }
+    }
 
     // Authorization secret — resolved per request
     const secret = resolveSecret(config)
 
+    await debugLog("PROMPT SENT TO PA", reinforcedPrompt)
+
     const result = await callFlow(reinforcedPrompt, modelId, signal, secret)
+
+    await debugLog("RESPONSE FROM PA", result.text)
 
     // Check if the response is a failed tool-call attempt. If so, retry once
     // with a corrective prompt that tells the model to output only JSON.
     const parsed = parseResponse(result.text)
+    await debugLog("PARSED AS", JSON.stringify(parsed, null, 2))
+
     if (parsed.type === "text" && looksLikeFailedToolCall(parsed.text)) {
+      await debugLog("RETRY", "Detected failed tool call, retrying with correction")
       const correctedPrompt = reinforcedPrompt + `\n\nAssistant: ${result.text}` + CORRECTIVE_RETRY_SUFFIX
+      await debugLog("CORRECTED PROMPT", correctedPrompt)
       const retryResult = await callFlow(correctedPrompt, modelId, signal, secret)
+      await debugLog("RETRY RESPONSE", retryResult.text)
       return retryResult
     }
 
