@@ -138,6 +138,8 @@ const BUNDLED_PROVIDERS: Record<string, () => Promise<(opts: any) => BundledSDK>
     import("./powerautomate/index.js").then((m) => m.createPowerAutomate),
   "@opencode-ai/cdp-provider": () =>
     import("./cdp/index.js").then((m) => m.createCDP),
+  "@opencode-ai/cdp-web-provider": () =>
+    import("./cdp-web/index.js").then((m) => m.createCDPWeb),
 }
 
 type CustomModelLoader = (sdk: any, modelID: string, options?: Record<string, any>, model?: Model) => Promise<any>
