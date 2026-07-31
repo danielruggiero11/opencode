@@ -18,8 +18,20 @@ export class CDPClient {
   private nextId = 1
   private pending = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>()
   private connected = false
+  private listeners = new Map<string, Set<(params: any) => void>>()
 
   constructor(private readonly wsUrl: string) {}
+
+  /** Subscribe to a CDP event (e.g. "Network.webSocketFrameReceived"). */
+  on(event: string, handler: (params: any) => void): void {
+    if (!this.listeners.has(event)) this.listeners.set(event, new Set())
+    this.listeners.get(event)!.add(handler)
+  }
+
+  /** Unsubscribe from a CDP event. */
+  off(event: string, handler: (params: any) => void): void {
+    this.listeners.get(event)?.delete(handler)
+  }
 
   async connect(): Promise<void> {
     if (this.connected) return
@@ -44,6 +56,12 @@ export class CDPClient {
             p.reject(new CDPError(`CDP error ${msg.error.code}: ${msg.error.message}`))
           } else {
             p.resolve(msg.result)
+          }
+        } else if (msg.method) {
+          // CDP event — dispatch to registered listeners
+          const handlers = this.listeners.get(msg.method)
+          if (handlers) {
+            for (const handler of handlers) handler(msg.params)
           }
         }
       } catch {}

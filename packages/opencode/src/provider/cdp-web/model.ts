@@ -20,6 +20,7 @@ import {
   type SharedV3Warning,
 } from "@ai-sdk/provider"
 import { parseResponse } from "./parse"
+import { parseResponse as parseResponseClean } from "../shim/parse"
 import { countTokens } from "../shim/tokenizer"
 import {
   createSession,
@@ -41,6 +42,8 @@ import {
   extractResponseRaw,
   attachFiles,
   CopilotReauthRequired,
+  enableWsCapture,
+  awaitResponseWs,
 } from "./driver"
 import { extractFilePathsFromText } from "./extract-paths"
 import { CDPClient, CDPError, findCopilotTabs, listTargets } from "./client"
@@ -96,6 +99,18 @@ function copilotPreamble(workspaceRoot: string): string {
 function toolsBlock(options: LanguageModelV3CallOptions, workspaceRoot: string): string {
   if (!options.tools?.length || options.toolChoice?.type === "none") return ""
   return formatCopilotTools(options.tools as Array<{ name: string; description?: string; inputSchema?: Record<string, any> }>, workspaceRoot)
+}
+
+/**
+ * Strip Copilot-injected footer text ("Generate the response in language...").
+ * This footer is appended to every response by the Copilot backend.
+ */
+function stripCopilotFooter(raw: string): string {
+  const idx = raw.indexOf("\nGenerate the re")
+  if (idx > 0) return raw.slice(0, idx).trimEnd()
+  const idx2 = raw.indexOf("\n\nGenerate the re")
+  if (idx2 > 0) return raw.slice(0, idx2).trimEnd()
+  return raw
 }
 
 function extractSystem(prompt: LanguageModelV3CallOptions["prompt"]): string {
@@ -414,6 +429,11 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     // Now wait for authentication to complete
     await this.waitForAuth(session)
 
+    // Enable WebSocket capture for the WS path (non-dom model IDs)
+    if (!this.modelId.includes("-dom") && session.client) {
+      await enableWsCapture(session.client)
+    }
+
     this.boundSession = session
     return session
   }
@@ -529,9 +549,24 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         // not in "temporary" mode by default.
         console.error("[cdp-web] calling openNewChat (temp chat)")
         await openNewChat(client)
-        console.error("[cdp-web] openNewChat done, setting effort:", this.config.effort)
+        console.error("[cdp-web] openNewChat done, waiting for UI settle before setEffort")
+        await new Promise((r) => setTimeout(r, 1500))
 
+        console.error("[cdp-web] setting effort:", this.config.effort)
         await setEffort(client, this.config.effort)
+
+        // Verify effort stuck — Copilot may re-render and reset after navigation
+        await new Promise((r) => setTimeout(r, 1000))
+        const verifyLabel = await client.evaluate(
+          `(document.getElementById('gptModeSwitcher')||{}).innerText||''`,
+        ) as string
+        const targetLabel = this.config.effort === "opus" ? "Opus" : this.config.effort
+        if (verifyLabel && !verifyLabel.toLowerCase().startsWith(targetLabel.toLowerCase())) {
+          console.error(`[cdp-web] effort NOT set! Switcher says "${verifyLabel.split("\n")[0]}", retrying...`)
+          await new Promise((r) => setTimeout(r, 1000))
+          await setEffort(client, this.config.effort)
+        }
+
         session.initialized = true
         session.turnCount = 0
         console.error("[cdp-web] init complete")
@@ -615,21 +650,62 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         await new Promise((r) => setTimeout(r, 500))
       }
 
-      let responseText: string
-      try {
-        responseText = await awaitResponse(client, turnsBefore, this.config.timeout, options.abortSignal)
-      } catch (err) {
-        if (err instanceof CopilotReauthRequired) {
-          session.authenticated = false
-        }
-        throw err
-      }
+      let finalText: string
+      let gotViaWs = false
+      const preferWs = !this.modelId.includes("-dom")
 
-      const raw = await extractResponseRaw(client, turnsBefore)
-      const finalText = raw || responseText
+      if (preferWs) {
+        // WebSocket capture path — SignalR frames have properly escaped JSON
+        try {
+          finalText = await awaitResponseWs(client, options.abortSignal)
+          gotViaWs = true
+          console.error(`[cdp-web ws] response (${finalText.length} chars): ${finalText.slice(0, 200)}`)
+        } catch (wsErr) {
+          // If WS capture fails (e.g. no Chathub WS detected), fall back to DOM
+          console.error(`[cdp-web ws] capture failed, falling back to DOM: ${(wsErr as Error).message}`)
+          let responseText: string
+          try {
+            responseText = await awaitResponse(client, turnsBefore, this.config.timeout, options.abortSignal)
+          } catch (err) {
+            if (err instanceof CopilotReauthRequired) {
+              session.authenticated = false
+            }
+            throw err
+          }
+          const raw = await extractResponseRaw(client, turnsBefore)
+          finalText = raw || responseText
+        }
+      } else {
+        // DOM polling path — needs repair pipeline
+        let responseText: string
+        try {
+          responseText = await awaitResponse(client, turnsBefore, this.config.timeout, options.abortSignal)
+        } catch (err) {
+          if (err instanceof CopilotReauthRequired) {
+            session.authenticated = false
+          }
+          throw err
+        }
+        const raw = await extractResponseRaw(client, turnsBefore)
+        finalText = raw || responseText
+      }
       session.turnCount++
 
-      const parsed = parseResponse(finalText)
+      // Strip Copilot footer for both paths (DOM parse.ts does it internally)
+      if (gotViaWs) finalText = stripCopilotFooter(finalText)
+
+      // Extract any commentary text before tool calls as reasoning
+      let thinking: string | undefined
+      if (gotViaWs) {
+        const firstBrace = finalText.indexOf('{"type":"tool_call"')
+        if (firstBrace > 0) {
+          const prefix = finalText.slice(0, firstBrace).trim()
+          if (prefix) thinking = prefix
+        }
+      }
+
+      // WS capture has proper JSON escaping → clean parse; DOM needs repair
+      const parsed = gotViaWs ? parseResponseClean(finalText, thinking) : parseResponse(finalText)
       const inputTokens = countTokens(messageToSend)
       const content: LanguageModelV3Content[] = []
       let outputTokens = 0

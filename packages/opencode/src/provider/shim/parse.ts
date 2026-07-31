@@ -115,13 +115,11 @@ export function parseResponse(raw: string, thinking?: string): ParsedResponse {
     i++
   }
 
-  if (calls.length > 0) return { type: "tool_calls", calls, thinking }
-
-  // Last-resort: scan for JSON tool calls embedded within non-JSON text. This
-  // handles cases where the model prefixes commentary on the same line as the
-  // tool call (e.g. "~ Updating... {\"type\":\"tool_call\",...}").
+  // Also try embedded extraction — handles multiple JSON objects on a single
+  // line (e.g. two tool calls separated by space with no newline between them).
   const embeddedCalls = extractEmbeddedToolCalls(raw)
-  if (embeddedCalls.length > 0) return { type: "tool_calls", calls: embeddedCalls, thinking }
+  if (embeddedCalls.length > calls.length) return { type: "tool_calls", calls: embeddedCalls, thinking }
+  if (calls.length > 0) return { type: "tool_calls", calls, thinking }
 
   return { type: "text", text: raw, thinking }
 }
