@@ -12,6 +12,15 @@ import { CDPClient, CDPError } from "./client"
 import { Log } from "@opencode-ai/core/util/log"
 
 const log = Log.create({ service: "cdp-web" })
+function _cdpFmt(a: unknown): string {
+  if (typeof a === "string") return a
+  if (a instanceof Error) return a.message
+  try { return JSON.stringify(a) } catch { return String(a) }
+}
+function dlog(...args: unknown[]): void {
+  log.error(args.map(_cdpFmt).join(" "))
+}
+
 
 const COMPOSER_ID = "m365-chat-editor-target-element"
 const TURN_SELECTOR = '[data-testid="m365-chat-llm-web-ui-chat-message"]'
@@ -99,9 +108,11 @@ export async function navigateToChat(client: CDPClient): Promise<void> {
  * Runtime to restore the execution context (Copilot internally navigates
  * when opening a new chat, invalidating the old context).
  */
-export async function openNewChat(client: CDPClient): Promise<void> {
-  // ─── New UI: toggle temporary mode + click sidebar "New chat" link ───
-  const hasNewUI = await ensureTemporaryMode(client)
+export async function openNewChat(client: CDPClient, temporary = true): Promise<void> {
+  // ─── New UI: (optionally) toggle temporary mode, then click "New chat" ───
+  const hasNewUI = temporary
+    ? await ensureTemporaryMode(client)
+    : await ensurePersistentMode(client)
 
   if (hasNewUI) {
     if (await client.clickSelector('a[aria-label="New chat"]')) {
@@ -112,8 +123,8 @@ export async function openNewChat(client: CDPClient): Promise<void> {
     }
   }
 
-  // ─── Old UI: split button dropdown → private chat ───
-  if (await client.clickSelector('[data-testid="newChatSplitButton"]')) {
+  // ─── Old UI: split button dropdown → private chat (temporary only) ───
+  if (temporary && await client.clickSelector('[data-testid="newChatSplitButton"]')) {
     await sleep(1000)
     if (await client.clickSelector('[data-testid="newPrivateChatButton"]')) {
       await sleep(1200)
@@ -153,16 +164,47 @@ async function ensureTemporaryMode(client: CDPClient): Promise<boolean> {
   `)
 
   if (pressed === "missing") {
-    console.error("[cdp-web openNewChat] temporary chat toggle not found (legacy UI)")
+    dlog("[cdp-web openNewChat] temporary chat toggle not found (legacy UI)")
     return false
   }
 
   if (pressed === "true") {
-    console.error("[cdp-web openNewChat] temporary chat already enabled")
+    dlog("[cdp-web openNewChat] temporary chat already enabled")
     return true
   }
 
-  console.error("[cdp-web openNewChat] enabling temporary chat mode")
+  dlog("[cdp-web openNewChat] enabling temporary chat mode")
+  await client.clickSelector('button[aria-label="Temporary chat"]')
+  await sleep(500)
+  return true
+}
+
+/**
+ * Ensure the "Temporary chat" toggle is NOT pressed (persistent chat).
+ * Persistent chats get a conversation GUID and appear in the sidebar,
+ * which is what makes them recoverable. Returns true if the new UI was
+ * detected (toggle exists), false otherwise.
+ */
+async function ensurePersistentMode(client: CDPClient): Promise<boolean> {
+  const pressed = await client.evaluate(`
+    (() => {
+      const btn = document.querySelector('button[aria-label="Temporary chat"]');
+      if (!btn) return 'missing';
+      return btn.getAttribute('aria-pressed');
+    })()
+  `)
+
+  if (pressed === "missing") {
+    dlog("[cdp-web openNewChat] temporary chat toggle not found (legacy UI)")
+    return false
+  }
+
+  if (pressed !== "true") {
+    dlog("[cdp-web openNewChat] persistent chat already enabled")
+    return true
+  }
+
+  dlog("[cdp-web openNewChat] disabling temporary chat mode (going persistent)")
   await client.clickSelector('button[aria-label="Temporary chat"]')
   await sleep(500)
   return true
@@ -176,7 +218,7 @@ async function ensureTemporaryMode(client: CDPClient): Promise<boolean> {
 export async function setEffort(client: CDPClient, effort: string): Promise<void> {
   const label = EFFORT_LABELS[effort]
   if (!label) {
-    console.error(`[cdp-web setEffort] unknown effort: ${effort}`)
+    dlog(`[cdp-web setEffort] unknown effort: ${effort}`)
     return
   }
 
@@ -190,7 +232,7 @@ export async function setEffort(client: CDPClient, effort: string): Promise<void
       })()
     `) as boolean
     if (switcherVisible) break
-    console.error(`[cdp-web setEffort] switcher not visible yet (attempt ${attempt + 1}/5)`)
+    dlog(`[cdp-web setEffort] switcher not visible yet (attempt ${attempt + 1}/5)`)
     await sleep(800)
   }
 
@@ -200,18 +242,18 @@ export async function setEffort(client: CDPClient, effort: string): Promise<void
     const current = (await client.evaluate(
       `(document.getElementById('gptModeSwitcher')||{}).innerText||''`,
     ) || "").split("\n")[0].trim()
-    console.error(`[cdp-web setEffort] current label: "${current}", target: "${label}"`)
+    dlog(`[cdp-web setEffort] current label: "${current}", target: "${label}"`)
     if (current.toLowerCase() === label.toLowerCase()) return
 
     // Open menu with real mouse click (Fluent menus need this)
     if (!await client.clickSelector("#gptModeSwitcher")) {
-      console.error(`[cdp-web setEffort] clickSelector(#gptModeSwitcher) failed`)
+      dlog(`[cdp-web setEffort] clickSelector(#gptModeSwitcher) failed`)
       return
     }
     await sleep(700)
 
     let selected = await clickRadioItem(client, label)
-    console.error(`[cdp-web setEffort] Path A initial: ${selected} (target: ${label})`)
+    dlog(`[cdp-web setEffort] Path A initial: ${selected} (target: ${label})`)
 
     // If not found at top level, expand the provider submenu (Claude/GPT)
     if (selected === "missing") {
@@ -219,7 +261,7 @@ export async function setEffort(client: CDPClient, effort: string): Promise<void
       if (expanded) {
         await sleep(600)
         selected = await clickRadioItem(client, label)
-        console.error(`[cdp-web setEffort] Path A after submenu expand: ${selected}`)
+        dlog(`[cdp-web setEffort] Path A after submenu expand: ${selected}`)
       }
     }
 
@@ -488,7 +530,7 @@ export async function awaitResponse(
     if (!text && !isGenerating && !hasSendBtn && !turnDone) {
       consecutiveEmpty++
       if (consecutiveEmpty === MAX_EMPTY_BEFORE_RECOVERY) {
-        console.error(`[cdp-web] awaitResponse: ${consecutiveEmpty} empty polls, re-enabling Runtime`)
+        dlog(`[cdp-web] awaitResponse: ${consecutiveEmpty} empty polls, re-enabling Runtime`)
         await client.send("Runtime.enable", {})
         await sleep(300)
         continue
@@ -499,7 +541,7 @@ export async function awaitResponse(
 
     // Debug log every 10 polls
     if (pollCount % 10 === 1) {
-      console.error(`[cdp-web] awaitResponse poll #${pollCount}: gen=${isGenerating} send=${hasSendBtn} done=${turnDone} len=${textLen} wasGen=${wasGenerating} stopGone=${stopGoneCount}`)
+      dlog(`[cdp-web] awaitResponse poll #${pollCount}: gen=${isGenerating} send=${hasSendBtn} done=${turnDone} len=${textLen} wasGen=${wasGenerating} stopGone=${stopGoneCount}`)
     }
 
     // Track that we saw the stop button
@@ -526,11 +568,11 @@ export async function awaitResponse(
         if (finalText) {
           stopGoneCount++
           if (stopGoneCount >= SETTLE_AFTER_STOP) {
-            console.error(`[cdp-web] awaitResponse: stop gone + settled (${stopGoneCount} polls). Returning ${finalLen} chars.`)
+            dlog(`[cdp-web] awaitResponse: stop gone + settled (${stopGoneCount} polls). Returning ${finalLen} chars.`)
             return finalText
           }
           if (hasSendBtn && turnDone) {
-            console.error(`[cdp-web] awaitResponse: stop gone + send + turnDone. Returning ${finalLen} chars.`)
+            dlog(`[cdp-web] awaitResponse: stop gone + send + turnDone. Returning ${finalLen} chars.`)
             return finalText
           }
         } else if (turnDone) {
@@ -538,7 +580,7 @@ export async function awaitResponse(
           // Give a few more polls then bail with empty to avoid infinite loop.
           stopGoneCount++
           if (stopGoneCount >= 10) {
-            console.error(`[cdp-web] awaitResponse: stop gone + turnDone but text empty after 10 polls. Bailing.`)
+            dlog(`[cdp-web] awaitResponse: stop gone + turnDone but text empty after 10 polls. Bailing.`)
             return ""
           }
         }
@@ -568,7 +610,7 @@ export async function awaitResponse(
     if (text && text === last) {
       stable++
       if (stable >= FALLBACK_STABLE) {
-        console.error(`[cdp-web] awaitResponse: text stable for ${stable} polls. Returning ${textLen} chars.`)
+        dlog(`[cdp-web] awaitResponse: text stable for ${stable} polls. Returning ${textLen} chars.`)
         return text
       }
     } else {
@@ -579,7 +621,7 @@ export async function awaitResponse(
     if (textLen >= LARGE_RESPONSE_CHARS && textLen === lastLen) {
       lengthStable++
       if (lengthStable >= FALLBACK_LEN_POLLS) {
-        console.error(`[cdp-web] awaitResponse: length stable for ${lengthStable} polls. Returning ${textLen} chars.`)
+        dlog(`[cdp-web] awaitResponse: length stable for ${lengthStable} polls. Returning ${textLen} chars.`)
         return text
       }
     } else if (textLen !== lastLen) {
@@ -592,7 +634,7 @@ export async function awaitResponse(
 
   // Timeout: return whatever we have (may be partial)
   if (last) {
-    console.error(`[cdp-web] awaitResponse: timeout reached, returning partial (${lastLen} chars)`)
+    dlog(`[cdp-web] awaitResponse: timeout reached, returning partial (${lastLen} chars)`)
     return last
   }
   throw new CDPError(`Copilot response did not complete within ${timeout}s`)
@@ -784,7 +826,7 @@ async function expandProviderSubmenu(client: CDPClient, targetLabel: string): Pr
     })()
   `)
   const parsed = JSON.parse(result || '{"expanded":false}')
-  console.error(`[cdp-web expandProviderSubmenu] target="${targetProvider}", result=${JSON.stringify(parsed)}`)
+  dlog(`[cdp-web expandProviderSubmenu] target="${targetProvider}", result=${JSON.stringify(parsed)}`)
 
   if (parsed.expanded) {
     // Use real CDP mouse click — Fluent UI menus require Input.dispatchMouseEvent
@@ -814,7 +856,7 @@ async function clickRadioItem(client: CDPClient, label: string): Promise<string>
     })()
   `)
   const parsed = JSON.parse(info || '{"status":"missing"}')
-  console.error(`[cdp-web clickRadioItem] target="${label}", result=${JSON.stringify(parsed)}`)
+  dlog(`[cdp-web clickRadioItem] target="${label}", result=${JSON.stringify(parsed)}`)
   if (parsed.status !== "found") return parsed.status
   await client.clickXY(parsed.x, parsed.y)
   await sleep(300)

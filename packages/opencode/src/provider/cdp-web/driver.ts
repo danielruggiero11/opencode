@@ -25,3 +25,12 @@ export {
 } from "./driver-dom"
 
 export { enableWsCapture, awaitResponseWs } from "./driver-ws"
+
+export {
+  getConversationInfo,
+  waitForConversationId,
+  openConversationById,
+  openConversationInSidebar,
+  reopenConversation,
+  type ConversationInfo,
+} from "./recovery"

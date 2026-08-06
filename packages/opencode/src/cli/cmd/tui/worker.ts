@@ -13,6 +13,7 @@ import { AppRuntime } from "@/effect/app-runtime"
 import { ensureProcessMetadata } from "@opencode-ai/core/util/opencode-process"
 import { Effect } from "effect"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { releaseOwnClaims } from "@/provider/cdp-web/claims"
 
 ensureProcessMetadata("worker")
 
@@ -90,6 +91,10 @@ export const rpc = {
   },
   async shutdown() {
     Log.Default.info("worker shutting down")
+
+    // Release this process's cdp-web tab claims so a clean /exit frees its tabs
+    // immediately (X-button/crash still fall back to dead-PID + TTL cleanup).
+    await releaseOwnClaims().catch(() => {})
 
     await InstanceRuntime.disposeAllInstances()
     if (server) await server.stop(true)

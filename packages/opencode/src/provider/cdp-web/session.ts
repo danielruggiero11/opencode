@@ -7,6 +7,7 @@
  * Copilot conversation.
  */
 import { CDPClient } from "./client"
+import { releaseClaim, releaseTargetClaim } from "./claims"
 
 export interface SessionState {
   /** Unique ID for this session */
@@ -23,10 +24,20 @@ export interface SessionState {
   initialized: boolean
   /** Number of assistant turns completed in this conversation */
   turnCount: number
+  /** Cumulative input tokens sent to Copilot across all turns (estimate) */
+  cumulativeInputTokens: number
+  /** Cumulative output tokens received from Copilot across all turns (estimate) */
+  cumulativeOutputTokens: number
   /** Whether this session is currently in use */
   busy: boolean
   /** Whether auth is valid for this tab */
   authenticated: boolean
+  /** Whether this session runs in temporary (non-persisted) mode */
+  temporary: boolean
+  /** Copilot-generated conversation GUID (persistent chats only) — the recovery key */
+  conversationId: string | null
+  /** Copilot-generated conversation title (for sidebar-match fallback) */
+  conversationTitle: string | null
 }
 
 // All active sessions keyed by ID
@@ -46,7 +57,7 @@ export function computeFingerprint(systemContent: string, toolNames: string[]): 
 /**
  * Create a new session (new tab will be opened).
  */
-export function createSession(fingerprint: string): SessionState {
+export function createSession(fingerprint: string, temporary = true): SessionState {
   const id = `cdp-web-${++nextSessionId}`
   const session: SessionState = {
     id,
@@ -56,8 +67,13 @@ export function createSession(fingerprint: string): SessionState {
     targetId: null,
     initialized: false,
     turnCount: 0,
+    cumulativeInputTokens: 0,
+    cumulativeOutputTokens: 0,
     busy: false,
     authenticated: true,
+    temporary,
+    conversationId: null,
+    conversationTitle: null,
   }
   sessions.set(id, session)
   return session
@@ -113,6 +129,14 @@ export function releaseSession(session: SessionState): void {
 export async function destroySession(id: string): Promise<void> {
   const session = sessions.get(id)
   if (!session) return
+  // Best-effort release of our cross-process tab claims (pid-liveness is the
+  // real backstop, so failure here is harmless).
+  if (session.conversationId) {
+    await releaseClaim(session.conversationId).catch(() => {})
+  }
+  if (session.targetId) {
+    await releaseTargetClaim(session.targetId).catch(() => {})
+  }
   if (session.client) {
     await session.client.disconnect().catch(() => {})
   }
@@ -124,6 +148,12 @@ export async function destroySession(id: string): Promise<void> {
  */
 export async function destroyAllSessions(): Promise<void> {
   for (const session of sessions.values()) {
+    if (session.conversationId) {
+      await releaseClaim(session.conversationId).catch(() => {})
+    }
+    if (session.targetId) {
+      await releaseTargetClaim(session.targetId).catch(() => {})
+    }
     if (session.client) {
       await session.client.disconnect().catch(() => {})
     }

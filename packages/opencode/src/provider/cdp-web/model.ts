@@ -26,6 +26,7 @@ import {
   createSession,
   acquireSession,
   releaseSession,
+  destroySession,
   connectSession,
   computeFingerprint,
   isTargetClaimed,
@@ -44,18 +45,49 @@ import {
   CopilotReauthRequired,
   enableWsCapture,
   awaitResponseWs,
+  waitForConversationId,
+  reopenConversation,
+  getConversationInfo,
 } from "./driver"
 import { extractFilePathsFromText } from "./extract-paths"
-import { CDPClient, CDPError, findCopilotTabs, listTargets } from "./client"
-import { ensureBrowser, openCopilotTab } from "./browser"
+import { CDPClient, CDPError, findCopilotTabs, listTargets, createTabViaCDP } from "./client"
+import { ensureBrowser, openCopilotTab, closeBrowser, getLaunchedHeadless } from "./browser"
+import { claimedGuids, writeClaim, releaseClaim, claimedTargetIds, writeTargetClaim, touchTargetClaim } from "./claims"
 import path from "path"
 import os from "os"
+import { existsSync } from "fs"
 import { formatCopilotTools } from "./tool-manifest"
+import { Log } from "@opencode-ai/core/util/log"
+const _cdpLog = Log.create({ service: "cdp-web" })
+function _cdpFmt(a: unknown): string {
+  if (typeof a === "string") return a
+  if (a instanceof Error) return a.message
+  try { return JSON.stringify(a) } catch { return String(a) }
+}
+function dlog(...args: unknown[]): void {
+  _cdpLog.error(args.map(_cdpFmt).join(" "))
+}
+
 
 interface CDPWebModelConfig {
   port: number
   effort: string
   timeout: number
+  /** Launch the browser headless. Config-driven via opencode.jsonc. Default false. */
+  headless?: boolean
+  /** Which browser to launch. Config-driven via opencode.jsonc. Default "chrome". */
+  browser?: "chrome" | "edge" | "auto"
+  /**
+   * DEBUG: force the full headless→headed swap machinery (close → relaunch →
+   * rebind) to run during a reauth EVEN when the steady-state is already headed.
+   * Lets you exercise/harden the swap path without committing to headless daily.
+   * You still trigger it by causing a real reauth (e.g. logging out). Default false.
+   */
+  forceAuthSwap?: boolean
+  /** Optional real browser User Data root to drive the user's actual profile. */
+  profileDir?: string
+  /** Optional --profile-directory (e.g. "Default") within that User Data root. */
+  profileDirectory?: string
 }
 
 /**
@@ -67,9 +99,28 @@ function extractWorkspaceRoot(systemText: string): string {
 }
 
 /**
+ * Look for a project manifest/guide file at the TOP LEVEL of the workspace
+ * (the folder we're located in — not subdirectories). Returns the absolute
+ * path of the first one found, or null if none exist. This is only a pointer;
+ * the file is never auto-loaded into the prompt.
+ */
+function findManifestFile(workspaceRoot: string): string | null {
+  const candidates = ["CLAUDE.md"]
+  for (const name of candidates) {
+    const full = path.join(workspaceRoot, name)
+    try {
+      if (existsSync(full)) return full
+    } catch {
+      // ignore fs errors — treat as "not present"
+    }
+  }
+  return null
+}
+
+/**
  * Build the Copilot system preamble — replaces the generic opencode system prompt.
  */
-function copilotPreamble(workspaceRoot: string): string {
+function copilotPreamble(workspaceRoot: string, manifestPath: string | null): string {
   return [
     'You are a coding agent working on a local project. I am your execution runtime.',
     'You do not have a local copy of the code and any sandbox you have is empty — do not try to read from it or verify anything yourself.',
@@ -88,6 +139,13 @@ function copilotPreamble(workspaceRoot: string): string {
     '  {"type":"tool_call","name":"grep","id":"g1","input":{"pattern":"meeting","include":"*.py"}}',
     '  {"type":"tool_call","name":"glob","id":"g2","input":{"pattern":"**/*notes*"}}',
     '- If calls depend on each other, do them one at a time. Wait for my result before continuing.',
+    ...(manifestPath
+      ? [
+          '',
+          `PROJECT MANIFEST: A guide for this codebase exists at ${manifestPath}.`,
+          'It is NOT loaded automatically. It documents this application\'s architecture, conventions, and file layout. If you need project context before editing, read it first with a read tool call.',
+        ]
+      : []),
     '',
     `Workspace: ${workspaceRoot}`,
   ].join('\n')
@@ -96,9 +154,14 @@ function copilotPreamble(workspaceRoot: string): string {
 /**
  * Format tool definitions using the curated Copilot manifest.
  */
-function toolsBlock(options: LanguageModelV3CallOptions, workspaceRoot: string): string {
+function toolsBlock(options: LanguageModelV3CallOptions, workspaceRoot: string, dropTask = false): string {
   if (!options.tools?.length || options.toolChoice?.type === "none") return ""
-  return formatCopilotTools(options.tools as Array<{ name: string; description?: string; inputSchema?: Record<string, any> }>, workspaceRoot)
+  // Subagents must never be told about the `task` tool: advertising it lets
+  // Copilot emit a task tool-call and spawn another subagent (runaway tabs).
+  const tools = dropTask
+    ? (options.tools as Array<{ name?: string }>).filter((t) => t.name !== "task")
+    : options.tools
+  return formatCopilotTools(tools as Array<{ name: string; description?: string; inputSchema?: Record<string, any> }>, workspaceRoot)
 }
 
 /**
@@ -130,6 +193,54 @@ function getToolNames(options: LanguageModelV3CallOptions): string[] {
     .filter((t): t is typeof t & { type: "function" } => t.type === "function")
     .map((t) => t.name)
     .sort()
+}
+
+/**
+ * Distinctive phrases from opencode's built-in SUBAGENT system prompts. The
+ * opencode system prompt is carried in options.prompt (even though cdp-web
+ * replaces it with its own Copilot preamble), so we can detect the agent here.
+ * When one of these is present, this turn is serving a subagent. Subagents must
+ * never spawn further subagents, so we neither advertise nor honor `task` for
+ * them. Extend this list if you add custom subagents with their own prompts.
+ */
+const SUBAGENT_PROMPT_SIGNATURES = [
+  "You are a file search specialist", // explore
+]
+
+/**
+ * Distinctive phrase from the title-generator agent's system prompt. When this
+ * is present in options.prompt, the turn is a title request, not a coding turn.
+ * We detect it here (provider-only) so we can send a lean, self-contained title
+ * prompt instead of the full coding-agent preamble + tool manifest, and so the
+ * ACTUAL conversation text is forwarded (formatInitialMessage would otherwise
+ * grab only the "Generate a title for this conversation:" stub and stop).
+ */
+const TITLE_PROMPT_SIGNATURE = "You are a title generator"
+
+function isTitleTurn(systemContent: string): boolean {
+  return systemContent.includes(TITLE_PROMPT_SIGNATURE)
+}
+
+/**
+ * Decide whether a doGenerate/doStream turn is serving a subagent. Two signals:
+ *  1. Temporary/burner sessions: this repo routes every cdp-web subagent
+ *     (explore) to the "-temp" model id, while the primary agent uses the
+ *     tracked non-temp id. So temporary === subagent under the current config.
+ *  2. Subagent prompt signature: defense in depth if a subagent is ever pointed
+ *     at the tracked model id.
+ * Erring toward "true" is safe: a false positive only costs the main agent the
+ * convenience of launching a subagent, while a false negative reintroduces the
+ * runaway subagent-spawns-subagent recursion this guards against.
+ */
+function isSubagentTurn(_temporary: boolean, systemContent: string): boolean {
+  // IMPORTANT: `temporary` is NOT a reliable subagent signal here. Per the
+  // product rule in CLAUDE.md ("All chats must be TEMPORARY"), the PRIMARY agent
+  // also runs on a "-temp" model id, so `temporary === true` for it too. Keying
+  // off it stripped/blocked `task` for the primary agent and broke its ability
+  // to launch subagents at all. The reliable signal is the subagent's own
+  // system-prompt signature (e.g. explore's "You are a file search specialist"),
+  // which rides along in options.prompt and never matches the primary agent.
+  return SUBAGENT_PROMPT_SIGNATURES.some((sig) => systemContent.includes(sig))
 }
 
 /**
@@ -251,11 +362,46 @@ function stripAttachmentRefs(text: string): string {
 }
 
 
-function formatInitialMessage(options: LanguageModelV3CallOptions): string {
+/**
+ * Build a lean, self-contained message for a title-generation turn. Unlike
+ * formatInitialMessage this sends NO coding-agent preamble, NO tool manifest,
+ * and NO project-manifest pointer. It also pulls the REAL conversation text out
+ * of the prompt (skipping system rules and the "Generate a title..." stub) so
+ * Copilot actually sees what it is supposed to title.
+ */
+function formatTitleMessage(options: LanguageModelV3CallOptions): string {
+  const convo: string[] = []
+  for (const msg of options.prompt) {
+    if (msg.role === "system") continue
+    const text = Array.isArray(msg.content)
+      ? (msg.content as Array<Record<string, any>>)
+          .filter((p): p is { type: "text"; text: string } => p.type === "text")
+          .map((p) => p.text)
+          .join("")
+      : String(msg.content)
+    const cleaned = stripAttachmentRefs(text).trim()
+    if (!cleaned) continue
+    if (cleaned.startsWith("Generate a title for this conversation")) continue
+    convo.push(cleaned)
+  }
+  const body = convo.join("\n").slice(0, 4000)
+
+  return [
+    "Generate a short title for a conversation that starts with the prompt below.",
+    "Keep it under 10 words. Output only the title, nothing else.",
+    "",
+    "<prompt>",
+    body,
+    "</prompt>",
+  ].join("\n")
+}
+
+function formatInitialMessage(options: LanguageModelV3CallOptions, dropTask = false): string {
   const systemText = extractSystem(options.prompt)
   const workspaceRoot = extractWorkspaceRoot(systemText)
-  const preamble = copilotPreamble(workspaceRoot)
-  const tools = toolsBlock(options, workspaceRoot)
+  const manifestPath = findManifestFile(workspaceRoot)
+  const preamble = copilotPreamble(workspaceRoot, manifestPath)
+  const tools = toolsBlock(options, workspaceRoot, dropTask)
   const sections: string[] = [preamble]
 
   if (tools) sections.push(tools)
@@ -364,12 +510,65 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
   readonly supportedUrls = {} as const
 
   private readonly config: CDPWebModelConfig
-  /** This instance's bound session — provides conversation affinity */
-  private boundSession: SessionState | null = null
+  /**
+   * Effective temporary/persistent mode for THIS model instance. Driven purely
+   * by the model id: a "-temp" suffix means temporary (disposable) chats; any
+   * other id means persistent (recoverable) chats. Lets the user keep two model
+   * ids (e.g. "opus" and "opus-temp") and flip between them with /model.
+   */
+  private readonly temporary: boolean
+  /**
+   * Per-opencode-session state map. Since core caches one CDPWebLanguageModel
+   * instance per model id, and the primary + explore subagent can share the same
+   * id (e.g. opus-temp), each opencode session needs its own tab/conversation
+   * binding. Keyed by opencode sessionID.
+   */
+  private sessions = new Map<string, { session: SessionState; fingerprint: string }>()
+
+  /**
+   * Set by waitForAuth the moment it detects login is required, and consumed by
+   * doStream to surface an on-screen "login required" notice in the opencode
+   * chat. This is how the user learns to go sign in — otherwise the turn just
+   * appears to hang while waitForAuth silently polls. Cleared once emitted.
+   */
+  private authNoticePending = false
+  private authNoticeText =
+    "🔐 **Login required.** M365 Copilot needs you to sign in.\n\n" +
+    "A browser window is open (or opening) — complete the Microsoft/Okta sign-in and MFA there. " +
+    "I'll detect it automatically and continue this turn once you're signed in (waiting up to 5 minutes)."
+
+  // ─── Cross-layer hooks (injected by session/llm.ts, mirrors GitLab model) ───
+  /** The opencode SessionID this model is serving, if known. */
+  sessionID?: string
+  /**
+   * Load a previously-persisted Copilot conversation ref for this opencode
+   * session (from Session.Info.metadata). Returns null if none stored yet.
+   */
+  loadConversationRef?: () => Promise<{ id: string | null; title: string | null } | null>
+  /**
+   * Persist the Copilot conversation ref (GUID + title) onto this opencode
+   * session's metadata so it survives an opencode restart.
+   */
+  saveConversationRef?: (ref: { id: string; title: string | null }) => Promise<void>
+  /**
+   * Load previously-persisted cumulative token totals for this opencode session.
+   * Copilot keeps conversation history server-side, so on resume a fresh
+   * SessionState would otherwise restart the counter at 0 and under-report the
+   * true context size. Returns null if none stored yet.
+   */
+  loadTokenTotals?: () => Promise<{ input: number; output: number } | null>
+  /**
+   * Persist the cumulative token totals onto this opencode session's metadata so
+   * the context-size estimate survives an opencode restart / conversation resume.
+   */
+  saveTokenTotals?: (totals: { input: number; output: number }) => Promise<void>
 
   constructor(modelId: string, config: CDPWebModelConfig) {
     this.modelId = modelId
     this.config = config
+    // Mode is driven entirely by the model id: "-temp" suffix => temporary,
+    // any other id => persistent. No provider-level default.
+    this.temporary = modelId.includes("-temp")
   }
 
   private metadata(): SharedV3ProviderMetadata {
@@ -377,26 +576,39 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
   }
 
   /**
-   * Ensure this instance has a bound session. Each CDPWebLanguageModel instance
-   * owns exactly one browser tab/conversation for its lifetime, providing
-   * session affinity so concurrent opencode sessions never cross-contaminate.
-   *
-   * If the fingerprint changes (system prompt or tools changed), the old
-   * session is abandoned and a new tab is opened.
+   * Release and destroy the Copilot tab bound to the given opencode session.
+   * Called by llm.ts when a session (especially a subagent) ends so the tab
+   * doesn't linger indefinitely. Safe to call multiple times or with unknown ids.
    */
-  private async ensureBoundSession(fingerprint: string): Promise<SessionState> {
-    // If we already have a bound session with matching fingerprint, reuse it
-    if (this.boundSession && this.boundSession.systemFingerprint === fingerprint && this.boundSession.authenticated) {
-      acquireSession(this.boundSession)
-      return this.boundSession
+  async releaseSessionForSid(sid: string): Promise<void> {
+    const entry = this.sessions.get(sid)
+    if (!entry) return
+    this.sessions.delete(sid)
+    dlog(`[cdp-web] releaseSessionForSid: destroying session for sid=${sid} (conv=${entry.session.conversationId ?? "(none)"})`)
+    await destroySession(entry.session.id)
+  }
+
+  /**
+   * Ensure this opencode session (identified by `sid`) has a bound Copilot tab.
+   * Each opencode session gets its own entry in the per-session map, so the
+   * primary and explore subagent can run concurrently without stomping state.
+   */
+  private async ensureBoundSession(sid: string, fingerprint: string): Promise<SessionState> {
+    // If we already have a bound session for this sid with matching fingerprint, reuse it
+    const existing = this.sessions.get(sid)
+    if (existing && existing.session.systemFingerprint === fingerprint && existing.session.authenticated) {
+      acquireSession(existing.session)
+      return existing.session
     }
 
-    const port = await ensureBrowser({ port: this.config.port })
+    if (existing) dlog(`[cdp-web] rebinding sid=${sid}: fingerprint changed or session not authenticated, was on conv ${existing.session.conversationId ?? "(none)"}`)
+    const prevConvId = existing?.session.conversationId ?? null
+    const port = await ensureBrowser({ port: this.config.port, headless: this.config.headless, browser: this.config.browser, profileDir: this.config.profileDir, profileDirectory: this.config.profileDirectory })
 
     // First, try to find an existing Copilot tab that's already open
     // (e.g., the one opened by the browser launch itself)
-    const session = createSession(fingerprint)
-    const existingTab = await this.findUsableTab(port)
+    const session = createSession(fingerprint, this.temporary)
+    const existingTab = await this.findUsableTab(port, sid, prevConvId)
 
     if (existingTab) {
       session.targetId = existingTab.id
@@ -404,26 +616,29 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       const wsUrl = existingTab.webSocketDebuggerUrl!.replace("localhost", "127.0.0.1")
       await connectSession(session, wsUrl)
     } else {
-      // No existing Copilot tab — try to create one
-      const tab = await openCopilotTab(port)
-      if (!tab || !tab.webSocketDebuggerUrl) {
-        // Even /json/new failed — try connecting to whatever page target exists
-        // (the browser may have a login page open that will redirect to chat)
-        const fallback = await this.findAnyPageTab(port)
-        if (!fallback) {
-          throw new CDPError("No browser tabs available. Is the browser running?")
-        }
-        session.targetId = fallback.id
-        acquireSession(session)
-        const wsUrl = fallback.webSocketDebuggerUrl!.replace("localhost", "127.0.0.1")
-        await connectSession(session, wsUrl)
-      } else {
-        session.targetId = tab.id
-        acquireSession(session)
-        await new Promise((r) => setTimeout(r, 3000))
-        const wsUrl = tab.webSocketDebuggerUrl.replace("localhost", "127.0.0.1")
-        await connectSession(session, wsUrl)
+      // No usable existing tab — open a genuinely NEW tab. Never hijack a tab
+      // another live session claims. Prefer the reliable browser-level
+      // Target.createTarget path; fall back to /json/new. Whatever we get, it
+      // must NOT be in the live claimed-target set before we drive it.
+      dlog("[cdp-web] no usable existing tab — creating a new one")
+      const claimedNow = await claimedTargetIds()
+      let tab = await createTabViaCDP(port, "https://m365.cloud.microsoft/chat")
+      if (!tab || !tab.webSocketDebuggerUrl || claimedNow.has(tab.id)) {
+        dlog(`[cdp-web] createTabViaCDP unusable (got=${tab?.id ?? "null"} claimed=${tab ? claimedNow.has(tab.id) : false}) — trying openCopilotTab`)
+        tab = await openCopilotTab(port)
       }
+      if (!tab || !tab.webSocketDebuggerUrl || claimedNow.has(tab.id)) {
+        throw new CDPError(
+          "cdp-web: could not open a new Copilot tab, and the only available tabs are in use by other sessions. " +
+            "Open a new Copilot tab in the browser and resend.",
+        )
+      }
+      dlog(`[cdp-web] opened new tab id=${tab.id}`)
+      session.targetId = tab.id
+      acquireSession(session)
+      await new Promise((r) => setTimeout(r, 3000))
+      const wsUrl = tab.webSocketDebuggerUrl.replace("localhost", "127.0.0.1")
+      await connectSession(session, wsUrl)
     }
 
     // Now wait for authentication to complete
@@ -434,17 +649,87 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       await enableWsCapture(session.client)
     }
 
-    this.boundSession = session
+    // Token-counter resume: seed the cumulative totals from persisted metadata
+    // so the context-size estimate continues climbing instead of restarting at
+    // 0 for this reopened conversation. Only meaningful for a freshly-created
+    // SessionState (totals still 0); never clobber an in-flight counter.
+    if (!session.temporary && session.cumulativeInputTokens === 0 && session.cumulativeOutputTokens === 0 && this.loadTokenTotals) {
+      try {
+        const totals = await this.loadTokenTotals()
+        if (totals) {
+          session.cumulativeInputTokens = totals.input
+          session.cumulativeOutputTokens = totals.output
+          dlog(`[cdp-web] resumed token totals: in=${totals.input} out=${totals.output}`)
+        }
+      } catch (e) {
+        dlog("[cdp-web] loadTokenTotals failed:", (e as Error).message)
+      }
+    }
+
+    // Persistent-chat resume: if this opencode session previously stored a
+    // Copilot conversation GUID, seed it so init reopens that chat instead of
+    // starting a fresh one. This is the /session restart recovery path.
+    if (!session.temporary && !session.conversationId && this.loadConversationRef) {
+      try {
+        const ref = await this.loadConversationRef(); dlog(`[cdp-web] loadConversationRef for ${sid} returned id=${ref?.id ?? "(null)"}`)
+        if (ref?.id) {
+          session.conversationId = ref.id
+          session.conversationTitle = ref.title
+          dlog(`[cdp-web] resumed stored conversation: id=${ref.id} title="${ref.title}"`)
+        }
+      } catch (e) {
+        dlog("[cdp-web] loadConversationRef failed:", (e as Error).message)
+      }
+    }
+
+    // Claim this tab by its CDP targetId in the cross-process registry. This
+    // runs for BOTH temporary and persistent sessions and works even before a
+    // conversation GUID exists — it's what stops another opencode process from
+    // stealing the temp tab we're about to drive.
+    if (session.targetId) {
+      // Pass temporary so the claim gets a lastTouched stamp and the idle TTL.
+      await writeTargetClaim(session.targetId, sid, session.temporary).catch((e) =>
+        dlog("[cdp-web] writeTargetClaim failed:", (e as Error).message),
+      )
+    }
+
+    this.sessions.set(sid, { session, fingerprint })
     return session
   }
 
   /**
-   * Find an existing Copilot chat tab that isn't already claimed by another session.
+   * Extract the Copilot conversation GUID from a tab URL, or null for a blank/
+   * new-chat tab (which carries no conversation GUID and is always stealable).
    */
-  private async findUsableTab(port: number) {
+  private tabGuid(url: string | undefined): string | null {
+    const m = (url || "").match(/\/chat\/conversation\/([0-9a-fA-F-]{36})/)
+    return m ? m[1] : null
+  }
+
+  /**
+   * Find an existing Copilot chat tab that is not in use by anyone.
+   *
+   * "Not in use" means: not claimed by another session in THIS process
+   * (isTargetClaimed) AND not claimed by a live OTHER opencode process
+   * (cross-process pid-keyed claim registry). A tab with no conversation GUID
+   * (blank/new chat) is always stealable. This is the inverted match the user
+   * asked for: "is there a tab that ISN'T on anyone's claimed list?"
+   */
+  private async findUsableTab(port: number, sid?: string, ownConversationId?: string | null) {
     const tabs = await findCopilotTabs(port)
+    const claimedGuidSet = await claimedGuids(sid)
+    const claimedTargetSet = await claimedTargetIds(sid)
     for (const tab of tabs) {
-      if (!isTargetClaimed(tab.id)) return tab
+      // In-process guard (this process's own sessions).
+      if (isTargetClaimed(tab.id)) continue
+      // Cross-process tab-id guard: another live opencode process is driving
+      // this exact tab (works for temp tabs that have no conversation GUID).
+      if (claimedTargetSet.has(tab.id)) continue
+      const guid = this.tabGuid(tab.url)
+      // Cross-process GUID guard: another live process owns this conversation.
+      // Blank tab (no guid) => stealable. Our own guid => fine to reuse.
+      if (guid && claimedGuidSet.has(guid) && guid !== ownConversationId) continue
+      return tab
     }
     return null
   }
@@ -468,22 +753,253 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
 
     // Quick check — maybe we're already authenticated
     const ready = await checkAuth(client)
-    if (ready) return
+    if (ready) {
+      session.authenticated = true
+      return
+    }
 
-    // Not authenticated — wait for the user to log in
-    // Give them up to 5 minutes to complete login
+    // ─── AUTH GATE ───────────────────────────────────────────────────────────
+    // Login/reauth is ALWAYS handled in a visible browser, regardless of the
+    // headless config setting. If we are running headless, the steady-state
+    // browser cannot show the Microsoft/Okta login, so surface it now: bring up
+    // a headed window on the SAME profile so the user can complete sign-in, then
+    // resume. (The headed-handoff swap is performed by ensureHeadedForAuth; in a
+    // headed steady-state it is a no-op and we just poll the visible tab.)
+    await this.ensureHeadedForAuth(session)
+
+    // Signal doStream to surface an on-screen notice so the user knows to go
+    // sign in (the turn would otherwise appear to hang silently here).
+    this.authNoticePending = true
+
+    // Prominent banner so the user understands WHY the turn paused. This goes to
+    // the provider log; the in-chat notice is emitted by doStream (Layer 2).
+    dlog(
+      "════════════════════════════════════════════════════════════\n" +
+        "  LOGIN REQUIRED — M365 Copilot needs you to sign in.\n" +
+        "  A browser window is open. Complete the Microsoft/Okta login\n" +
+        "  (and MFA) there. This turn will continue automatically once\n" +
+        "  you are signed in. Waiting up to 5 minutes...\n" +
+        "════════════════════════════════════════════════════════════",
+    )
+
+    // Wait for the user to log in. Give them up to 5 minutes to complete login.
     const authTimeout = 300_000
     const deadline = Date.now() + authTimeout
     const pollInterval = 2000
-
+    const port = this.config.port
+    let reconnectLogged = false
+    // The login flow is a NAVIGATION STORM: the tab redirects chat -> AAD ->
+    // Okta -> back. Each cross-origin navigation destroys the page's CDP target
+    // and kills the WebSocket we were attached to, so the client we started with
+    // is almost always dead by the time the user is mid-login. Therefore every
+    // iteration must (1) ensure a LIVE client by reconnecting to whatever page
+    // target currently exists (findAnyPageTab sees the login.microsoftonline.com
+    // tab, which the chat-only findCopilotTabs filter does not), and (2) swallow
+    // per-poll errors so a transient "Not connected" during a redirect means
+    // "still logging in, keep waiting" rather than killing the turn.
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, pollInterval))
-      const authed = await checkAuth(client)
-      if (authed) return
+      try {
+        // Ensure we have a live client. If ours is missing or its socket has
+        // dropped (navigation), reconnect to the current page target.
+        let c = session.client
+        if (!c || !c.isConnected()) {
+          if (!reconnectLogged) {
+            dlog("[cdp-web] auth gate: client not connected (login navigation), reconnecting to live tab")
+            reconnectLogged = true
+          }
+          if (c) {
+            await c.disconnect().catch(() => {})
+          }
+          session.client = null
+          const tab = await this.findAnyPageTab(port)
+          if (!tab || !tab.webSocketDebuggerUrl) {
+            // No page target right now (mid-navigation teardown). Try next tick.
+            continue
+          }
+          session.targetId = tab.id
+          const wsUrl = tab.webSocketDebuggerUrl.replace("localhost", "127.0.0.1")
+          await connectSession(session, wsUrl)
+          c = session.client
+          reconnectLogged = false
+        }
+        if (!c) continue
+
+        const authed = await checkAuth(c)
+        if (authed) {
+          session.authenticated = true
+          dlog("[cdp-web] auth gate cleared — user is signed in.")
+          // If we swapped headed just for login, return to headless steady-state.
+          await this.restoreHeadlessAfterAuth(session).catch((e) =>
+            dlog("[cdp-web] restoreHeadlessAfterAuth failed (continuing):", (e as Error).message),
+          )
+          dlog("[cdp-web] resuming turn after reauth.")
+          return
+        }
+      } catch (e) {
+        // Transient failure during the login navigation storm (dropped socket,
+        // stale execution context, tab swap). Drop the client so the next tick
+        // reconnects, and keep waiting — this is expected, not fatal.
+        dlog("[cdp-web] auth gate poll error (expected during login nav, retrying):", (e as Error).message)
+        const dead = session.client
+        session.client = null
+        if (dead) await dead.disconnect().catch(() => {})
+      }
     }
 
     session.authenticated = false
     throw new CopilotReauthRequired()
+  }
+
+  /**
+   * Ensure a VISIBLE browser is available for the login/reauth flow.
+   *
+   * Auth must always be headed. When the steady-state browser is already headed
+   * (the default today), this is a no-op — the login page is already visible in
+   * the session's tab and we just poll it.
+   *
+   * When running headless (config headless=true), the login cannot be shown in
+   * the invisible browser. Layer 2 will implement the serialized swap here:
+   *   quit headless → launch headed on the SAME profile → user logs in →
+   *   quit headed → relaunch headless → resume.
+   * Until that lands, we fail loudly rather than stranding the user behind an
+   * invisible login wall.
+   */
+  private async ensureHeadedForAuth(session: SessionState): Promise<void> {
+    const forceSwap = this.config.forceAuthSwap === true
+    // Steady-state headed and not force-testing: login is already visible,
+    // nothing to swap.
+    if (!this.config.headless && !forceSwap) return
+
+    // ─── LAYER 2: headless → headed swap for login ───────────────────────────
+    // Two Chromium processes cannot share one --user-data-dir, so we cannot run
+    // a headed login window alongside the headless working browser. Serialize:
+    // close headless (release the profile lock), relaunch HEADED on the same
+    // profile+port, then rebind this session to a fresh visible tab. waitForAuth
+    // then polls that visible tab while the user signs in. restoreHeadlessAfter-
+    // Auth() reverses this once auth clears.
+    const port = this.config.port
+    const runningHeadless = getLaunchedHeadless(port)
+    // Normally, if the browser is already headed there is nothing to swap — just
+    // rebind. But with forceAuthSwap we deliberately run the FULL close/relaunch/
+    // rebind cycle even when already headed, to exercise and harden the swap path.
+    if (runningHeadless === false && !forceSwap) {
+      dlog("[cdp-web] ensureHeadedForAuth: browser already headed — rebinding only")
+      await this.rebindToFreshTab(session, port)
+      return
+    }
+
+    dlog(
+      forceSwap
+        ? "[cdp-web] ensureHeadedForAuth: forceAuthSwap — running full close/relaunch/rebind cycle (headed)"
+        : "[cdp-web] ensureHeadedForAuth: closing headless browser to swap headed for login",
+    )
+    // Drop our dead client handle first; the browser is about to go away.
+    if (session.client) {
+      await session.client.disconnect().catch(() => {})
+      session.client = null
+    }
+    const closed = await closeBrowser(port)
+    if (!closed) {
+      dlog("[cdp-web] ensureHeadedForAuth: closeBrowser timed out — profile may be locked; aborting swap")
+      throw new CopilotReauthRequired()
+    }
+
+    // Relaunch HEADED on the same profile + port. ensureBrowser reuses the same
+    // getProfileDir(browser) mapping, so the persisted session/cookies are intact.
+    dlog("[cdp-web] ensureHeadedForAuth: relaunching headed for login")
+    await ensureBrowser({ port, headless: false, browser: this.config.browser, profileDir: this.config.profileDir, profileDirectory: this.config.profileDirectory })
+    await this.rebindToFreshTab(session, port)
+  }
+
+  /**
+   * After auth clears, return to the configured steady-state mode. If we are
+   * supposed to run headless but are currently headed (because we swapped for
+   * login), close the headed browser and relaunch headless, then rebind. No-op
+   * when steady-state is headed or already in the right mode.
+   */
+  private async restoreHeadlessAfterAuth(session: SessionState): Promise<void> {
+    if (!this.config.headless) return
+    const port = this.config.port
+    if (getLaunchedHeadless(port) === true) return // already headless
+
+    dlog("[cdp-web] restoreHeadlessAfterAuth: auth done — swapping back to headless")
+    if (session.client) {
+      await session.client.disconnect().catch(() => {})
+      session.client = null
+    }
+    const closed = await closeBrowser(port)
+    if (!closed) {
+      dlog("[cdp-web] restoreHeadlessAfterAuth: closeBrowser timed out; staying headed for this turn")
+      // Non-fatal: we can still serve the turn headed. Rebind and continue.
+      await ensureBrowser({ port, headless: false, browser: this.config.browser, profileDir: this.config.profileDir, profileDirectory: this.config.profileDirectory })
+      await this.rebindToFreshTab(session, port)
+      return
+    }
+    await ensureBrowser({ port, headless: true, browser: this.config.browser, profileDir: this.config.profileDir, profileDirectory: this.config.profileDirectory })
+    await this.rebindToFreshTab(session, port)
+    // The relaunched headless browser is cold. Wait for it to load and prove it
+    // is authenticated BEFORE returning, so the resumed doGenerate's immediate
+    // pre-send checkAuth does not see a still-loading page and re-trigger the
+    // whole auth swap (the two-window cascade).
+    await this.waitForReady(session)
+  }
+
+  /**
+   * Rebind a session onto a fresh usable tab on `port` after a browser swap.
+   * Clears the stale client/target, finds or creates a tab, and connects. The
+   * conversationId is preserved so the post-auth init path can reopen the same
+   * Copilot conversation (persistent chats).
+   */
+  private async rebindToFreshTab(session: SessionState, port: number, sid?: string): Promise<void> {
+    session.client = null
+    session.targetId = null
+    session.initialized = false // force re-init (reopen conversation) after swap
+
+    let tab = await this.findUsableTab(port, sid, session.conversationId ?? undefined)
+    if (!tab) {
+      const created = await createTabViaCDP(port, "https://m365.cloud.microsoft/chat")
+      tab = created ?? (await openCopilotTab(port))
+    }
+    if (!tab || !tab.webSocketDebuggerUrl) {
+      throw new CDPError("cdp-web: could not acquire a tab after browser swap")
+    }
+    session.targetId = tab.id
+    const wsUrl = tab.webSocketDebuggerUrl.replace("localhost", "127.0.0.1")
+    await connectSession(session, wsUrl)
+    if (session.targetId && sid) {
+      await writeTargetClaim(session.targetId, sid, session.temporary).catch(() => {})
+    }
+  }
+
+  /**
+   * After a browser relaunch/rebind, the new tab is COLD — it just launched,
+   * navigated to /chat, and has not finished loading or applying the persisted
+   * session cookies yet. Checking auth immediately (as the resumed doGenerate
+   * does) sees a not-yet-ready page and wrongly declares a reauth, causing an
+   * endless swap cascade. This polls checkAuth for up to timeoutMs so the cold
+   * browser has time to settle and prove it is actually signed in before we hand
+   * the session back. Returns true once ready, false on timeout.
+   */
+  private async waitForReady(session: SessionState, timeoutMs = 30_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const c = session.client
+      if (c && c.isConnected()) {
+        try {
+          if (await checkAuth(c)) {
+            session.authenticated = true
+            dlog("[cdp-web] waitForReady: relaunched browser is ready and authenticated")
+            return true
+          }
+        } catch {
+          // page mid-load; keep polling
+        }
+      }
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+    dlog("[cdp-web] waitForReady: relaunched browser did not become ready within timeout")
+    return false
   }
 
   async doGenerate(options: LanguageModelV3CallOptions): Promise<{
@@ -499,18 +1015,37 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     response: { timestamp: Date; modelId: string }
     warnings: SharedV3Warning[]
   }> {
+    // Snapshot sessionID immediately — core mutates this.sessionID before each
+    // call (llm.ts:228), so a concurrent subagent turn can overwrite it while
+    // we're mid-await. The local `sid` stays stable for this entire turn.
+    const sid = this.sessionID ?? `anon-${Date.now()}`
     const systemContent = extractSystem(options.prompt)
     const toolNames = getToolNames(options)
     const fingerprint = computeFingerprint(systemContent, toolNames)
+    // Subagent turns (e.g. explore) must not advertise or execute the `task`
+    // tool — otherwise a subagent can spawn another subagent, opening a runaway
+    // cascade of Copilot tabs. Detected purely inside the provider.
+    const isSubagent = isSubagentTurn(this.temporary, systemContent)
 
-    const session = await this.ensureBoundSession(fingerprint)
+    let session = await this.ensureBoundSession(sid, fingerprint)
 
     try {
+      // This turn is activity: re-stamp the temp claim's idle TTL so an actively
+      // used temp chat never ages out mid-conversation. No-op for tracked chats.
+      if (session.targetId) {
+        await touchTargetClaim(session.targetId).catch(() => {})
+      }
+
       let messageToSend: string
       let isInitial = false
+      // Set true when we reopen a pre-existing conversation on resume (used by
+      // the resume path below; declared here so the whole method can see it).
+      let resumedExisting = false
 
       if (!session.initialized || session.messagesSent >= options.prompt.length) {
-        messageToSend = formatInitialMessage(options)
+        messageToSend = isTitleTurn(systemContent)
+          ? formatTitleMessage(options)
+          : formatInitialMessage(options, isSubagent)
         isInitial = true
       } else {
         messageToSend = formatDeltaMessages(options.prompt, session.messagesSent)
@@ -524,35 +1059,137 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         }
       }
 
-      const client = session.client
+      let client = session.client
       if (!client) throw new CDPError("Session has no connected client")
 
-      // Check auth before proceeding
-      const authed = await checkAuth(client)
+      // Check auth before proceeding. If auth dropped mid-session (token expiry
+      // / Conditional Access), do NOT throw — open the auth gate, let the user
+      // sign in via the visible browser, and resume this same turn automatically.
+      // IMPORTANT: retry a few times before concluding reauth is needed. Right
+      // after a browser relaunch/swap the page can be COLD (still loading, cookies
+      // not applied yet); a single failed read here would wrongly re-enter the
+      // auth gate and cause the swap cascade. A short retry absorbs that.
+      let authed = await checkAuth(client)
       if (!authed) {
-        session.authenticated = false
-        throw new CopilotReauthRequired()
+        for (let attempt = 0; attempt < 5 && !authed; attempt++) {
+          await new Promise((r) => setTimeout(r, 1500))
+          try {
+            authed = client.isConnected() ? await checkAuth(client) : false
+          } catch {
+            authed = false
+          }
+          if (authed) dlog(`[cdp-web] pre-send auth check passed on retry ${attempt + 1} (page was cold)`)
+        }
+      }
+      if (!authed) {
+        dlog("[cdp-web] pre-send auth check failed after retries — entering auth gate")
+        await this.waitForAuth(session)
+        // waitForAuth may have swapped the client (headed handoff). Re-read it.
+        client = session.client
+        if (!client) throw new CDPError("Session has no connected client after reauth")
+      }
+
+      // Per-turn drift guard: for an established persistent session, verify the
+      // tab still shows OUR conversation. If it was stolen, idle-reset to /chat,
+      // or navigated elsewhere, force re-init so the reopen block below re-navigates
+      // to our GUID (opening/acquiring a fresh tab if ours is gone). Prevents
+      // sending this turn into another session's conversation.
+      if (!isInitial && session.initialized && !session.temporary && session.conversationId) {
+        const live = await getConversationInfo(client).catch(() => ({ id: null, title: null, url: "" }))
+        const claimedByOther = session.targetId ? (await claimedTargetIds(sid)).has(session.targetId) : false
+        if (live.id !== session.conversationId || claimedByOther) {
+          dlog(`[cdp-web] drift: tab on ${live.id ?? "(none)"} but we own ${session.conversationId} (claimedByOther=${claimedByOther}) — re-acquiring our own tab`)
+          this.sessions.delete(sid)
+          session = await this.ensureBoundSession(sid, fingerprint)
+          session.initialized = false
+          client = session.client
+          if (!client) throw new CDPError("Session has no connected client after drift re-acquire")
+        }
       }
 
       // Initialize conversation if needed
       if (isInitial || !session.initialized) {
-        console.error("[cdp-web] initializing: opening temp chat + setting effort")
+        dlog("[cdp-web] initializing: opening temp chat + setting effort")
         const hasComposer = await checkComposer(client)
         if (!hasComposer) {
-          console.error("[cdp-web] NO COMPOSER FOUND — reauth required")
-          session.authenticated = false
-          throw new CopilotReauthRequired()
+          dlog("[cdp-web] NO COMPOSER FOUND — entering auth gate (likely reauth)")
+          await this.waitForAuth(session)
+          client = session.client
+          if (!client) throw new CDPError("Session has no connected client after reauth")
         }
 
         // Always open a temporary chat for isolation and to avoid polluting history.
         // This is required even on fresh tabs (0 turns) because a fresh tab is
         // not in "temporary" mode by default.
-        console.error("[cdp-web] calling openNewChat (temp chat)")
-        await openNewChat(client)
-        console.error("[cdp-web] openNewChat done, waiting for UI settle before setEffort")
+        // Resume path: we have a stored Copilot GUID for this opencode session
+        // (loaded in ensureBoundSession). Reopen that conversation instead of
+        // starting a fresh one, so history/context is preserved across restarts.
+        let reopened = false
+        if (!session.temporary && session.conversationId) {
+          // Fast path: if we stole the tab already displaying this conversation
+          // (findTabByConversationId), we're on the right page already — no nav.
+          const cur = await getConversationInfo(client)
+          if (cur.id === session.conversationId) {
+            dlog(`[cdp-web] resume: tab already on conversation ${session.conversationId} — no nav needed`)
+            reopened = true
+            resumedExisting = true
+          } else {
+            dlog(`[cdp-web] resume: reopening conversation ${session.conversationId}`)
+            reopened = await reopenConversation(client, {
+              id: session.conversationId,
+              title: session.conversationTitle,
+            })
+          }
+          if (reopened) {
+            await client.send("Runtime.enable", {})
+            resumedExisting = true
+            // Re-assert our claim now that we're driving this conversation again
+            // (our pid changed across the restart, so refresh the registry).
+            await writeClaim(session.conversationId, sid).catch((e) =>
+              dlog("[cdp-web] writeClaim (resume) failed:", (e as Error).message),
+            )
+        } else {
+          // Reopen failed. Do NOT silently start a fresh chat and replay the
+          // original prompt (that resurrects the first message and drops all
+          // context — the old fallback bug). Keep the stored GUID so a retry
+          // can still re-enter this resume path. First try a manual "force"
+          // adopt: if the user has navigated this tab to a real conversation
+          // with a live composer, pick up wherever the tab currently is.
+          const failedId = session.conversationId
+          const cur = await getConversationInfo(client)
+          const hasComposerNow = await checkComposer(client)
+          if (cur.id && hasComposerNow) {
+            dlog(`[cdp-web] resume reopen failed for ${failedId}, but tab is on ${cur.id} — adopting it`)
+            session.conversationId = cur.id
+            session.conversationTitle = cur.title
+            reopened = true
+            resumedExisting = true
+            await client.send("Runtime.enable", {})
+            await writeClaim(cur.id, sid).catch((e) =>
+              dlog("[cdp-web] writeClaim (adopt) failed:", (e as Error).message),
+            )
+            if (this.saveConversationRef) {
+              await this.saveConversationRef({ id: cur.id, title: cur.title }).catch((e) =>
+                dlog("[cdp-web] saveConversationRef (adopt) failed:", (e as Error).message),
+              )
+            }
+          } else {
+            throw new CDPError(
+              `cdp-web: could not reopen conversation ${failedId}. ` +
+                `Open that conversation in the Copilot browser tab this session is driving, then send your message again to reconnect.`,
+            )
+          }
+        }
+      }
+
+        if (!reopened) {
+          dlog(`[cdp-web] calling openNewChat (temporary=${this.temporary})`)
+          await openNewChat(client, this.temporary)
+        }
+        dlog("[cdp-web] init nav done, waiting for UI settle before setEffort")
         await new Promise((r) => setTimeout(r, 1500))
 
-        console.error("[cdp-web] setting effort:", this.config.effort)
+        dlog("[cdp-web] setting effort:", this.config.effort)
         await setEffort(client, this.config.effort)
 
         // Verify effort stuck — Copilot may re-render and reset after navigation
@@ -562,32 +1199,47 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         ) as string
         const targetLabel = this.config.effort === "opus" ? "Opus" : this.config.effort
         if (verifyLabel && !verifyLabel.toLowerCase().startsWith(targetLabel.toLowerCase())) {
-          console.error(`[cdp-web] effort NOT set! Switcher says "${verifyLabel.split("\n")[0]}", retrying...`)
+          dlog(`[cdp-web] effort NOT set! Switcher says "${verifyLabel.split("\n")[0]}", retrying...`)
           await new Promise((r) => setTimeout(r, 1000))
           await setEffort(client, this.config.effort)
         }
 
         session.initialized = true
         session.turnCount = 0
-        console.error("[cdp-web] init complete")
+        dlog("[cdp-web] init complete")
+      }
+
+      // Resume with existing history: if we reopened a pre-existing conversation,
+      // the Copilot chat already contains the full preamble/tools/prior turns.
+      // Re-sending the initial payload would duplicate all of it, so replace it
+      // with just the newest user/tool turn. Mark this as a non-initial turn so
+      // the first-turn navigation handling below is skipped.
+      if (resumedExisting) {
+        const latest = formatDeltaMessages(options.prompt, Math.max(0, options.prompt.length - 1))
+        if (latest.trim()) {
+          messageToSend = latest
+          isInitial = false
+          session.turnCount = 1
+          dlog("[cdp-web] resume: sending latest turn only, skipping initial preamble")
+        }
       }
 
       // Handle file attachments (images, PDFs, Office docs)
       // These get uploaded via Copilot's native file handler.
       // Only extract from NEW messages to avoid re-uploading on follow-up turns.
       const attachFromIndex = isInitial ? 0 : (session.messagesSent || 0)
-      console.error(`[cdp-web] attachment scan: isInitial=${isInitial}, attachFromIndex=${attachFromIndex}, promptLen=${options.prompt.length}, messagesSent=${session.messagesSent}`)
-      console.error(`[cdp-web] prompt roles: ${options.prompt.map((m, i) => `${i}:${m.role}`).join(", ")}`)
+      dlog(`[cdp-web] attachment scan: isInitial=${isInitial}, attachFromIndex=${attachFromIndex}, promptLen=${options.prompt.length}, messagesSent=${session.messagesSent}`)
+      dlog(`[cdp-web] prompt roles: ${options.prompt.map((m, i) => `${i}:${m.role}`).join(", ")}`)
       const attachments: Array<{ data: string | Uint8Array | URL; mediaType: string; filename?: string }> = [
         ...extractAttachments(options.prompt, attachFromIndex),
       ]
-      console.error("[cdp-web] attachments extracted:", attachments.length,
+      dlog("[cdp-web] attachments extracted:", attachments.length,
         attachments.map(a => ({ mime: a.mediaType, hasData: !!a.data, dataType: typeof a.data })))
       // Debug: dump user message content types
       for (const msg of options.prompt) {
         if (msg.role !== "user" || !Array.isArray(msg.content)) continue
         for (const part of msg.content as Array<Record<string, any>>) {
-          console.error(`[cdp-web] user part: type=${part.type}, keys=${Object.keys(part).join(",")}`, part.type === "text" ? `text(first100)=${(part.text||'').slice(0,100)}` : "")
+          dlog(`[cdp-web] user part: type=${part.type}, keys=${Object.keys(part).join(",")}`, part.type === "text" ? `text(first100)=${(part.text||'').slice(0,100)}` : "")
         }
       }
       // Debug: log what parts exist BEFORE extractAttachments filters them
@@ -595,10 +1247,10 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         if (msg.role !== "user" || !Array.isArray(msg.content)) continue
         for (const part of msg.content as Array<Record<string, any>>) {
           if (part.type === "file" || part.type === "image") {
-            console.error("[cdp-web] raw part in prompt:", { type: part.type, mediaType: part.mediaType, mimeType: part.mimeType, filename: part.filename })
+            dlog("[cdp-web] raw part in prompt:", { type: part.type, mediaType: part.mediaType, mimeType: part.mimeType, filename: part.filename })
           }
           if (part.type === "text" && (part.text?.includes("ERROR:") || part.text?.includes("[PDF"))) {
-            console.error("[cdp-web] TEXT PART (likely stripped):", part.text.slice(0, 150))
+            dlog("[cdp-web] TEXT PART (likely stripped):", part.text.slice(0, 150))
           }
         }
       }
@@ -615,9 +1267,9 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
             const mime = extensionToMime(ext)
             const data = await readFile(filePath)
             attachments.push({ data, mediaType: mime, filename: path.basename(filePath) })
-            console.error(`[cdp-web] detected file path in text: ${filePath} (${fileStat.size} bytes, ${mime})`)
+            dlog(`[cdp-web] detected file path in text: ${filePath} (${fileStat.size} bytes, ${mime})`)
           } catch (e) {
-            console.error(`[cdp-web] could not read detected file path: ${filePath}`, e)
+            dlog(`[cdp-web] could not read detected file path: ${filePath}`, e)
           }
         }
       }
@@ -633,10 +1285,39 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
 
       // Count turns BEFORE sending (the response will be the next one)
       const turnsBefore = await getTurnCount(client)
-      console.error(`[cdp-web] turnsBefore (pre-send): ${turnsBefore}, isInitial=${isInitial}`)
+      dlog(`[cdp-web] turnsBefore (pre-send): ${turnsBefore}, isInitial=${isInitial}`)
 
-      await sendPrompt(client, messageToSend)
-      session.messagesSent = options.prompt.length
+    await sendPrompt(client, messageToSend)
+    session.messagesSent = options.prompt.length
+
+    // For persistent chats, capture the conversation GUID + title on the first
+    // turn. Copilot assigns these shortly after the first message is sent.
+    // This GUID is the recovery key used to re-open the chat after a timeout.
+    if (!session.temporary && !session.conversationId) {
+        const info = await waitForConversationId(client, 20000)
+      if (info.id) {
+        session.conversationId = info.id
+        session.conversationTitle = info.title
+        dlog(`[cdp-web] captured conversation: id=${info.id} title="${info.title}"`)
+        // Claim this tab in the cross-process registry so other live opencode
+        // instances won't steal it while we're using it.
+        await writeClaim(info.id, sid).catch((e) =>
+          dlog("[cdp-web] writeClaim failed:", (e as Error).message),
+        )
+        // Persist onto the opencode session's metadata so it survives a
+        // restart — this is what makes /session resume able to reopen it.
+        if (this.saveConversationRef) {
+          try {
+            const existingRef = this.loadConversationRef ? await this.loadConversationRef().catch(() => null) : null; if (existingRef?.id && existingRef.id !== info.id && !resumedExisting) { dlog(`[cdp-web] NOT overwriting stored ref ${existingRef.id} with throwaway ${info.id}`); session.conversationId = existingRef.id; session.conversationTitle = existingRef.title } else { await this.saveConversationRef({ id: info.id, title: info.title }) }
+            dlog(`[cdp-web] persisted conversation ref to opencode session ${sid}`)
+          } catch (e) {
+            dlog("[cdp-web] saveConversationRef failed:", (e as Error).message)
+          }
+        }
+      } else {
+        dlog("[cdp-web] no conversation GUID captured yet (may appear next turn)")
+      }
+    }
 
       // On the FIRST message in a conversation, Copilot navigates after Send,
       // invalidating the Runtime context. On subsequent messages (tool results),
@@ -659,10 +1340,10 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         try {
           finalText = await awaitResponseWs(client, options.abortSignal)
           gotViaWs = true
-          console.error(`[cdp-web ws] response (${finalText.length} chars): ${finalText.slice(0, 200)}`)
+          dlog(`[cdp-web ws] response (${finalText.length} chars): ${finalText.slice(0, 200)}`)
         } catch (wsErr) {
           // If WS capture fails (e.g. no Chathub WS detected), fall back to DOM
-          console.error(`[cdp-web ws] capture failed, falling back to DOM: ${(wsErr as Error).message}`)
+          dlog(`[cdp-web ws] capture failed, falling back to DOM: ${(wsErr as Error).message}`)
           let responseText: string
           try {
             responseText = await awaitResponse(client, turnsBefore, this.config.timeout, options.abortSignal)
@@ -706,17 +1387,56 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
 
       // WS capture has proper JSON escaping → clean parse; DOM needs repair
       const parsed = gotViaWs ? parseResponseClean(finalText, thinking) : parseResponse(finalText)
-      const inputTokens = countTokens(messageToSend)
+
+      // ─── Cumulative token accounting (CDP-Web only) ───
+      // Unlike the shim providers, CDP sends only a delta each turn (Copilot
+      // keeps history server-side). So we accumulate both sides on the session:
+      //   context so far = every message we sent + every response we received.
+      // Input: count messageToSend as-sent (initial preamble OR delta).
+      // Output: count the RAW finalText, not the parsed payload — tool-call
+      //   JSON is plaintext the model generated and is real output tokens.
+      // Ephemeral reasoning tokens are intentionally ignored: they are not
+      //   capturable and are discarded across turns, so they never accumulate
+      //   into the ongoing context window.
+      const turnInputTokens = countTokens(messageToSend)
+      const turnOutputTokens = countTokens(finalText)
+      session.cumulativeInputTokens += turnInputTokens
+      session.cumulativeOutputTokens += turnOutputTokens
+      dlog(`[cdp-web] tokens turn: in=${turnInputTokens} out=${turnOutputTokens} | cumulative: in=${session.cumulativeInputTokens} out=${session.cumulativeOutputTokens}`)
+      // Persist the running totals so a /session resume after restart continues
+      // the counter instead of restarting at 0. Best-effort for persistent chats
+      // only; temp chats are disposable so there is nothing to resume.
+      if (!session.temporary && this.saveTokenTotals) {
+        await this.saveTokenTotals({
+          input: session.cumulativeInputTokens,
+          output: session.cumulativeOutputTokens,
+        }).catch((e) => dlog("[cdp-web] saveTokenTotals failed:", (e as Error).message))
+      }
+
+      // Hard block: a subagent turn must never emit a `task` tool-call. Even
+      // with task dropped from the advertised tools, Copilot can still emit one
+      // (it saw the tool on an earlier turn, or hallucinated it). Filter those
+      // out here so the recursion can never reach opencode core.
+      const emittedCalls =
+        parsed.type === "tool_calls"
+          ? parsed.calls.filter((c) => {
+              if (isSubagent && c.name === "task") {
+                dlog(`[cdp-web] BLOCKED task tool-call from subagent (id=${c.id}) — subagents cannot spawn subagents`)
+                return false
+              }
+              return true
+            })
+          : []
+      const hasToolCalls = emittedCalls.length > 0
+
       const content: LanguageModelV3Content[] = []
-      let outputTokens = 0
 
       if (parsed.thinking) content.push({ type: "reasoning", text: parsed.thinking })
 
-      if (parsed.type === "tool_calls") {
-        console.error(`[cdp-web] parsed ${parsed.calls.length} tool call(s): ${parsed.calls.map((c) => `${c.name}(${c.id})`).join(", ")}`)
-        outputTokens = countTokens(parsed.calls.map((c) => c.input).join(""))
-        for (const call of parsed.calls) {
-          console.error(`[cdp-web]   call ${call.name}: input=${call.input.slice(0, 200)}`)
+      if (hasToolCalls) {
+        dlog(`[cdp-web] parsed ${emittedCalls.length} tool call(s): ${emittedCalls.map((c) => `${c.name}(${c.id})`).join(", ")}`)
+        for (const call of emittedCalls) {
+          dlog(`[cdp-web]   call ${call.name}: input=${call.input.slice(0, 200)}`)
           content.push({
             type: "tool-call",
             toolCallId: call.id,
@@ -724,20 +1444,43 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
             input: call.input,
           })
         }
+      } else if (parsed.type === "tool_calls") {
+        // Every tool-call this turn was blocked (a subagent tried to spawn a
+        // subagent). End the turn as a clean stop so core does not wait on tool
+        // results that will never arrive.
+        content.push({ type: "text", text: "A nested subagent (task) call was blocked; subagents cannot spawn subagents." })
       } else {
-        outputTokens = countTokens(parsed.text)
         content.push({ type: "text", text: parsed.text })
+      }
+
+      // Subagent tab cleanup: when the subagent's final turn completes (no more
+      // tool calls → finishReason "stop"), destroy its Copilot tab so it doesn't
+      // linger. Primary sessions keep their tab for conversation continuity.
+      if (isSubagent && !hasToolCalls) {
+        dlog(`[cdp-web] subagent final turn (stop) — scheduling tab cleanup for sid=${sid}`)
+        this.releaseSessionForSid(sid).catch((e) =>
+          dlog(`[cdp-web] releaseSessionForSid failed: ${(e as Error).message}`),
+        )
       }
 
       return {
         content,
         finishReason: {
-          unified: parsed.type === "tool_calls" ? "tool-calls" : "stop",
-          raw: parsed.type === "tool_calls" ? "tool_use" : "end_turn",
+          unified: hasToolCalls ? "tool-calls" : "stop",
+          raw: hasToolCalls ? "tool_use" : "end_turn",
         },
         usage: {
-          inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: undefined, cacheWrite: undefined },
-          outputTokens: { total: outputTokens, text: outputTokens, reasoning: undefined },
+          inputTokens: {
+            total: session.cumulativeInputTokens,
+            noCache: session.cumulativeInputTokens,
+            cacheRead: undefined,
+            cacheWrite: undefined,
+          },
+          outputTokens: {
+            total: session.cumulativeOutputTokens,
+            text: session.cumulativeOutputTokens,
+            reasoning: undefined,
+          },
           raw: undefined,
         },
         providerMetadata: this.metadata(),
@@ -794,11 +1537,11 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       filePaths.push(filePath)
       // Log first 8 bytes as hex for PNG header validation (should be 89 50 4E 47 0D 0A 1A 0A)
       const header = buffer.slice(0, 8).toString("hex").match(/../g)?.join(" ") ?? ""
-      console.error(`[cdp-web] wrote attachment: ${filePath} (${buffer.length} bytes, header: ${header})`)
+      dlog(`[cdp-web] wrote attachment: ${filePath} (${buffer.length} bytes, header: ${header})`)
     }
 
     if (filePaths.length > 0) {
-      console.error(`[cdp-web] uploading ${filePaths.length} files via file input`)
+      dlog(`[cdp-web] uploading ${filePaths.length} files via file input`)
       await attachFiles(client, filePaths)
     }
   }
@@ -808,13 +1551,44 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     request: { body: string }
     response: { headers: Record<string, string> }
   }> {
-    const result = await this.doGenerate(options)
-    const warnings: SharedV3Warning[] = result.warnings
-    const providerMetadata = result.providerMetadata
+    // Kick off generation WITHOUT awaiting, so the stream can surface an
+    // on-screen "login required" notice while doGenerate is still blocked inside
+    // waitForAuth (up to 5 min). We poll authNoticePending and, if it flips,
+    // emit the notice as visible text before the real answer streams in.
+    this.authNoticePending = false
+    const self = this
+    const genPromise = this.doGenerate(options)
 
     const stream = new ReadableStream<LanguageModelV3StreamPart>({
-      start(controller) {
-        controller.enqueue({ type: "stream-start", warnings })
+      async start(controller) {
+        controller.enqueue({ type: "stream-start", warnings: [] as SharedV3Warning[] })
+
+        // Race the generation against the auth-notice signal. If doGenerate
+        // enters the auth gate, authNoticePending flips true and we render the
+        // notice on screen immediately, then keep waiting for generation.
+        let noticeShown = false
+        let done = false
+        const result = await new Promise<Awaited<ReturnType<typeof self.doGenerate>>>(
+          (resolve, reject) => {
+            genPromise.then(
+              (r) => { done = true; resolve(r) },
+              (e) => { done = true; reject(e) },
+            )
+            const poll = () => {
+              if (done) return
+              if (self.authNoticePending && !noticeShown) {
+                noticeShown = true
+                self.authNoticePending = false
+                controller.enqueue({ type: "text-start", id: "auth-notice" })
+                controller.enqueue({ type: "text-delta", id: "auth-notice", delta: self.authNoticeText })
+                controller.enqueue({ type: "text-end", id: "auth-notice" })
+              }
+              setTimeout(poll, 500)
+            }
+            poll()
+          },
+        )
+        const providerMetadata = result.providerMetadata
 
         for (const part of result.content) {
           if (part.type === "reasoning") {
@@ -851,7 +1625,7 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
 
     return {
       stream,
-      request: result.request,
+      request: { body: "" },
       response: { headers: {} },
     }
   }

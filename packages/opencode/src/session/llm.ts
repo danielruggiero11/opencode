@@ -209,6 +209,84 @@ const live: Layer.Layer<
         })
       }
 
+      // cdp-web (M365 Copilot browser automation): inject the opencode
+      // sessionID plus load/save hooks so the provider can persist the Copilot
+      // conversation GUID onto this session's metadata and reopen it on resume.
+      // Duck-typed by provider marker to avoid a circular import of the class.
+      if ((language as { provider?: string }).provider === "cdp-web") {
+        const cdp = language as {
+          sessionID?: string
+          releaseSessionForSid?: (sid: string) => Promise<void>
+          loadConversationRef?: () => Promise<{ id: string | null; title: string | null } | null>
+          saveConversationRef?: (ref: { id: string; title: string | null }) => Promise<void>
+          loadTokenTotals?: () => Promise<{ input: number; output: number } | null>
+          saveTokenTotals?: (totals: { input: number; output: number }) => Promise<void>
+        }
+        const sessionID = input.sessionID
+        const cdpBridge = yield* EffectBridge.make()
+        const META_KEY = "copilotConversation"
+        const TOKENS_META_KEY = "copilotTokenTotals"
+        cdp.sessionID = sessionID
+        // Run the Session effects through cdpBridge.promise: the bridge captured
+        // this fiber's instance/workspace context AND the full AppLayer context
+        // (which provides Session.Service) at make() time. Session.Service.use is
+        // the correct accessor — Session.use is a serviceUse Proxy and is NOT
+        // callable, which is what threw "X.use is not a function" before.
+        cdp.loadConversationRef = async () => {
+          const { Session } = await import("@/session/session")
+          return cdpBridge.promise(
+            Session.Service.use((svc) =>
+              Effect.gen(function* () {
+                const info = yield* svc.get(SessionID.make(sessionID)); const ref = (info.metadata?.[META_KEY] ?? null) as { id: string | null; title: string | null } | null
+                return ref && ref.id ? ref : null
+              }),
+             
+            ),
+          )
+        }
+        cdp.saveConversationRef = async (conversationRef: { id: string; title: string | null }) => {
+          const { Session } = await import("@/session/session")
+          await cdpBridge.promise(
+            Session.Service.use((svc) =>
+              Effect.gen(function* () {
+                const info = yield* svc.get(SessionID.make(sessionID))
+                const metadata = { ...(info.metadata ?? {}) }
+                metadata[META_KEY] = conversationRef
+                yield* svc.setMetadata({ sessionID: SessionID.make(sessionID), metadata })
+              }),
+            ),
+          )
+        }
+        // Cumulative token totals persist under a SEPARATE metadata key so the
+        // context-size estimate survives a restart/resume without entangling the
+        // conversation-ref overwrite guards above.
+        cdp.loadTokenTotals = async () => {
+          const { Session } = await import("@/session/session")
+          return cdpBridge.promise(
+            Session.Service.use((svc) =>
+              Effect.gen(function* () {
+                const info = yield* svc.get(SessionID.make(sessionID))
+                const totals = (info.metadata?.[TOKENS_META_KEY] ?? null) as { input: number; output: number } | null
+                return totals && typeof totals.input === "number" && typeof totals.output === "number" ? totals : null
+              }),
+            ),
+          )
+        }
+        cdp.saveTokenTotals = async (totals: { input: number; output: number }) => {
+          const { Session } = await import("@/session/session")
+          await cdpBridge.promise(
+            Session.Service.use((svc) =>
+              Effect.gen(function* () {
+                const info = yield* svc.get(SessionID.make(sessionID))
+                const metadata = { ...(info.metadata ?? {}) }
+                metadata[TOKENS_META_KEY] = totals
+                yield* svc.setMetadata({ sessionID: SessionID.make(sessionID), metadata })
+              }),
+            ),
+          )
+        }
+      }
+
       const tracer = cfg.experimental?.openTelemetry
         ? Option.getOrUndefined(yield* Effect.serviceOption(OtelTracer.OtelTracer))
         : undefined

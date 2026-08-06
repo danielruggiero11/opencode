@@ -78,6 +78,24 @@ function createTransport(config: ServiceNowConfig): ShimTransport {
       const data = (await res.json()) as Record<string, unknown>
       const result = (data?.result as Record<string, unknown> | undefined) ?? {}
       const capabilities = (result.capabilities as Record<string, unknown> | undefined) ?? {}
+
+      // Top-level failure (permission/ACL, invalid capability id, etc.): ServiceNow
+      // returns result.status === "error", an empty capabilities object, and a
+      // human-readable result.message. This is NOT an output-size problem, so it
+      // must not be retried or reported as a context/output-limit error.
+      if (result.status === "error" || Object.keys(capabilities).length === 0) {
+        const message = typeof result.message === "string" ? result.message : JSON.stringify(result)
+        log.error("servicenow request rejected", { capabilityId, message: message.slice(0, 300) })
+        throw new APICallError({
+          message: `ServiceNow rejected the request for capability ${capabilityId}: ${message}`,
+          url: endpoint,
+          requestBodyValues: { capabilityId },
+          statusCode: 403,
+          responseBody: JSON.stringify(result).slice(0, 1000),
+          isRetryable: false,
+        })
+      }
+
       const cap = capabilities[capabilityId] as Record<string, unknown> | undefined
 
       if (!cap || cap.status !== "success") {
@@ -170,22 +188,34 @@ export function createServiceNow(
     fetch?: unknown
   },
 ) {
-  const config: ServiceNowConfig = {
+  const baseConfig: ServiceNowConfig = {
     instanceURL: String(opts.instanceURL ?? ""),
     username: String(opts.username ?? ""),
     password: String(opts.password ?? ""),
+    // Provider-level capabilityId is now only a fallback default. Each model can
+    // override it via its own `options.capabilityId` in opencode.jsonc. The
+    // per-model value arrives here through the getModel loader in provider.ts,
+    // which forwards the merged { ...provider.options, ...model.options }.
     capabilityId: String(opts.capabilityId ?? ""),
     fetch: typeof opts.fetch === "function" ? (opts.fetch as typeof globalThis.fetch) : undefined,
   }
 
-  const transport = createTransport(config)
+  // Build a language model bound to a specific capability id, preferring the
+  // per-model override and falling back to the provider-level default. A fresh
+  // transport closure per model is cheap and keeps each model pointed at its
+  // own capability, so multiple models can run concurrently.
+  const modelFor = (modelId: string, options?: Record<string, unknown>): LanguageModelV3 => {
+    const capabilityId = String((options?.capabilityId as string | undefined) ?? baseConfig.capabilityId)
+    const transport = createTransport({ ...baseConfig, capabilityId })
+    return new ShimLanguageModel(modelId, { provider: "servicenow", transport })
+  }
 
   return {
-    languageModel(modelId: string): LanguageModelV3 {
-      return new ShimLanguageModel(modelId, { provider: "servicenow", transport })
+    languageModel(modelId: string, options?: Record<string, unknown>): LanguageModelV3 {
+      return modelFor(modelId, options)
     },
-    chat(modelId: string): LanguageModelV3 {
-      return new ShimLanguageModel(modelId, { provider: "servicenow", transport })
+    chat(modelId: string, options?: Record<string, unknown>): LanguageModelV3 {
+      return modelFor(modelId, options)
     },
   }
 }

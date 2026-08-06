@@ -264,6 +264,42 @@ export async function createNewTab(port: number, url: string): Promise<CDPTarget
 }
 
 /**
+ * Create a new tab reliably via the browser-level CDP endpoint
+ * (Target.createTarget). Unlike GET /json/new, this works even when Chrome's
+ * HTTP new-tab endpoint is disabled or when we attached to a user-launched
+ * browser. Returns the new tab's CDPTarget (with a page-level ws url) or null.
+ */
+export async function createTabViaCDP(port: number, url: string): Promise<CDPTarget | null> {
+  try {
+    const verRes = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(5000) })
+    const ver = await verRes.json() as { webSocketDebuggerUrl?: string }
+    const browserWs = ver.webSocketDebuggerUrl?.replace("localhost", "127.0.0.1")
+    if (!browserWs) return null
+    const browser = new CDPClient(browserWs)
+    await browser.connect()
+    let newTargetId: string | undefined
+    try {
+      const created = await browser.send("Target.createTarget", { url }) as { targetId?: string }
+      newTargetId = created?.targetId
+    } finally {
+      await browser.disconnect()
+    }
+    if (!newTargetId) return null
+    // Resolve the fresh target's page ws url from /json, retrying briefly since
+    // the new target may take a moment to appear in the list.
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const targets = await listTargets(port)
+      const match = targets.find((t) => t.id === newTargetId)
+      if (match && match.webSocketDebuggerUrl) return match
+      await new Promise((r) => setTimeout(r, 300))
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
  * Close a tab by target ID.
  */
 export async function closeTab(port: number, targetId: string): Promise<boolean> {

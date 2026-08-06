@@ -185,6 +185,21 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
           },
         },
       }),
+    servicenow: () =>
+      Effect.succeed({
+        // Config-only provider (not in modelsDev), so it must autoload when
+        // configured; otherwise its getModel loader below would never register
+        // and per-model options would be dropped. The custom loop skips any
+        // provider missing from `database`, so this only fires when configured.
+        autoload: true,
+        async getModel(sdk: any, modelID: string, options?: Record<string, any>) {
+          // Forward the merged { ...provider.options, ...model.options } so a
+          // per-model `capabilityId` in opencode.jsonc reaches the transport,
+          // letting each ServiceNow model target its own Now Assist capability.
+          return sdk.languageModel(modelID, options)
+        },
+        options: {},
+      }),
     opencode: Effect.fnUntraced(function* (input: Info) {
       const env = yield* dep.env()
       const hasKey = iife(() => {

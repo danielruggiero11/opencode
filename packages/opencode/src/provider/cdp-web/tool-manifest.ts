@@ -56,11 +56,34 @@ export const COPILOT_TOOLS: Record<string, CopilotToolDef | null> = {
       content: 'string, required — full file content',
     },
   },
+  question: {
+    description:
+      "Ask the user one or more multiple-choice questions and STOP. I will collect their answers and paste them back before you continue. Use this when you need a decision or clarification rather than guessing.",
+    params: {
+      questions:
+        'array, required — each item is {"question": string (the full question), "header": string (short label, max 30 chars), "options": [{"label": string (1-5 words), "description": string}], "multiple": boolean (optional, allow selecting more than one)}',
+    },
+  },
+  todowrite: {
+    description:
+      "Record or update your task plan as a checklist so progress is visible. Emit the FULL updated list every time (not just the changed item). Mark exactly one item in_progress while you work it.",
+    params: {
+      todos:
+        'array, required — the complete todo list; each item is {"content": string (task description), "status": "pending" | "in_progress" | "completed" | "cancelled", "priority": "high" | "medium" | "low"}',
+    },
+  },
+  task: {
+    description:
+      "Launch a specialized subagent (e.g. \"explore\") to handle a scoped piece of work and return its result. Use it to offload focused investigation or research instead of doing it inline.",
+    params: {
+      description: 'string, required — short 3-5 word description of the task',
+      prompt: 'string, required — the full instruction for the subagent to perform',
+      subagent_type: 'string, required — the agent type to use, e.g. "explore"',
+      task_id: 'string, optional — pass a prior task_id to resume that subagent session instead of starting fresh',
+    },
+  },
   // Excluded tools — not useful for Copilot's single-turn JSON output
-  task: null,
-  todowrite: null,
   skill: null,
-  question: null,
   webfetch: null,
   "github-pr-search": null,
   "github-triage": null,

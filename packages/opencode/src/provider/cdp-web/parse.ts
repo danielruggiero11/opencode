@@ -1,4 +1,15 @@
 import { parseResponse as shimParseResponse, type ParsedResponse } from "../shim/parse"
+import { Log } from "@opencode-ai/core/util/log"
+const _cdpLog = Log.create({ service: "cdp-web" })
+function _cdpFmt(a: unknown): string {
+  if (typeof a === "string") return a
+  if (a instanceof Error) return a.message
+  try { return JSON.stringify(a) } catch { return String(a) }
+}
+function dlog(...args: unknown[]): void {
+  _cdpLog.error(args.map(_cdpFmt).join(" "))
+}
+
 
 /**
  * CDP-Web response parser.
@@ -8,7 +19,7 @@ export function parseResponse(raw: string, thinking?: string): ParsedResponse {
   if (typeof raw !== "string") {
     raw = raw != null ? JSON.stringify(raw) : ""
   }
-  console.error(`[cdp-web parse] raw (${raw.length} chars): ${raw.slice(0, 300)}`)
+  dlog(`[cdp-web parse] raw (${raw.length} chars): ${raw.slice(0, 300)}`)
 
   // Strip Copilot injected footer (always appended after the actual response)
   let cleaned = stripCopilotFooter(raw)
@@ -17,7 +28,7 @@ export function parseResponse(raw: string, thinking?: string): ParsedResponse {
   cleaned = cleaned.trim()
 
   if (cleaned !== raw.trim()) {
-    console.error(`[cdp-web parse] cleaned (${cleaned.length} chars): ${cleaned.slice(0, 300)}`)
+    dlog(`[cdp-web parse] cleaned (${cleaned.length} chars): ${cleaned.slice(0, 300)}`)
   }
 
   // Repair unescaped backslashes BEFORE any JSON.parse attempt.
@@ -28,13 +39,13 @@ export function parseResponse(raw: string, thinking?: string): ParsedResponse {
   const repaired = repairJsonLines(cleaned)
 
   if (repaired !== cleaned) {
-    console.error(`[cdp-web parse] repaired (${repaired.length} chars): ${repaired.slice(0, 300)}`)
+    dlog(`[cdp-web parse] repaired (${repaired.length} chars): ${repaired.slice(0, 300)}`)
   }
 
   // Try with repaired text first (handles Windows path backslashes)
   const result = shimParseResponse(repaired, thinking)
   if (result.type === "tool_calls") {
-    console.error(`[cdp-web parse] OK: ${result.calls.length} tool call(s): ${result.calls.map((c) => c.name).join(", ")}`)
+    dlog(`[cdp-web parse] OK: ${result.calls.length} tool call(s): ${result.calls.map((c) => c.name).join(", ")}`)
     return result
   }
 
@@ -42,12 +53,12 @@ export function parseResponse(raw: string, thinking?: string): ParsedResponse {
   if (repaired !== cleaned) {
     const fallback = shimParseResponse(cleaned, thinking)
     if (fallback.type === "tool_calls") {
-      console.error(`[cdp-web parse] OK (fallback): ${fallback.calls.length} tool call(s): ${fallback.calls.map((c) => c.name).join(", ")}`)
+      dlog(`[cdp-web parse] OK (fallback): ${fallback.calls.length} tool call(s): ${fallback.calls.map((c) => c.name).join(", ")}`)
       return fallback
     }
   }
 
-  console.error(`[cdp-web parse] text response (no tool calls): ${result.text.slice(0, 100)}`)
+  dlog(`[cdp-web parse] text response (no tool calls): ${result.text.slice(0, 100)}`)
   return result
 }
 
@@ -120,33 +131,90 @@ function repairJsonLines(text: string): string {
  *   "filePath": "C:\Users\drugg\test.txt"
  * where \U, \t etc. are NOT intended as JSON escapes but as literal
  * path separators. JSON.parse would interpret \t as tab, corrupting
- * the object. We double all lone backslashes inside JSON strings.
+ * the object.
  *
- * Already-escaped sequences (\\) are preserved as-is.
+ * Strategy is CONTEXT-AWARE, decided per string VALUE rather than per char
+ * (this is how a human reads it: you see "C:\" and know the whole token is a
+ * path, so every backslash in it is literal):
+ *  - If a value looks like it contains a Windows path (drive-letter "C:\" or
+ *    UNC "\\server"), EVERY backslash in that value is a literal separator, so
+ *    we double all of them — even \t, \n, \r that would otherwise look like
+ *    valid JSON escapes (e.g. "...\log\test.txt", where \t must stay literal).
+ *  - Otherwise we only double INVALID escapes (\d, \s, ...) and leave genuine
+ *    escapes (\n, \t, \", \\, \uXXXX) intact, so a real newline in a non-path
+ *    command still works.
+ *
+ * Already-escaped (\\) and escaped-quote (\") sequences are always preserved.
  */
 function repairBackslashes(json: string): string {
-  // Only activate when the text looks like it contains Windows paths
-  if (!/[A-Za-z]:\\?[A-Za-z]/i.test(json) && !/[A-Za-z]:[/\\]/i.test(json)) return json
+  // Fast out: nothing to repair if there are no backslashes at all.
+  if (json.indexOf("\\") < 0) return json
+
   let result = ""
-  let inString = false
-  for (let i = 0; i < json.length; i++) {
+  let i = 0
+  while (i < json.length) {
     const ch = json[i]
-    if (ch === '"' && (i === 0 || json[i - 1] !== '\\')) {
-      inString = !inString
+    if (ch !== '"') {
       result += ch
-    } else if (inString && ch === '\\') {
-      const next = json[i + 1]
-      // Already-escaped: \\ or \" — pass through both chars
-      if (next === '\\' || next === '"') {
-        result += ch + next
-        i++
-      } else {
-        // Lone backslash — double it so JSON.parse sees a literal backslash
-        result += '\\\\'
-      }
-    } else {
-      result += ch
+      i++
+      continue
     }
+    // Opening quote — scan the raw inner text up to the unescaped closing quote,
+    // consuming backslash-escaped pairs so an escaped quote (\") doesn't end it.
+    let j = i + 1
+    let value = ""
+    while (j < json.length) {
+      if (json[j] === "\\") {
+        value += json[j] + (json[j + 1] ?? "")
+        j += 2
+        continue
+      }
+      if (json[j] === '"') break
+      value += json[j]
+      j++
+    }
+    result += '"' + repairValueBackslashes(value) + '"'
+    i = j + 1
   }
   return result
+}
+
+/** Valid JSON string escape follow-characters. */
+const VALID_JSON_ESCAPE = new Set(['"', "\\", "/", "b", "f", "n", "r", "t", "u"])
+
+/** True when a string value looks like it carries a Windows path. */
+function looksLikeWindowsPath(value: string): boolean {
+  return /[A-Za-z]:\\/.test(value) || /\\\\[A-Za-z0-9]/.test(value)
+}
+
+/**
+ * Repair backslashes within a single JSON string value's raw inner text.
+ * Path context literalizes every backslash; otherwise only invalid escapes are.
+ */
+function repairValueBackslashes(value: string): string {
+  const isPath = looksLikeWindowsPath(value)
+  let out = ""
+  for (let k = 0; k < value.length; k++) {
+    if (value[k] !== "\\") {
+      out += value[k]
+      continue
+    }
+    const next = value[k + 1]
+    // Always preserve an already-escaped backslash or quote.
+    if (next === "\\" || next === '"') {
+      out += value[k] + next
+      k++
+    } else if (isPath) {
+      // Path context: this backslash is a literal separator — double it.
+      out += "\\\\"
+    } else if (next !== undefined && VALID_JSON_ESCAPE.has(next)) {
+      // Genuine escape in a non-path value — keep as-is.
+      out += value[k] + next
+      k++
+    } else {
+      // Invalid escape (\d, \s, trailing \) — literalize.
+      out += "\\\\"
+    }
+  }
+  return out
 }

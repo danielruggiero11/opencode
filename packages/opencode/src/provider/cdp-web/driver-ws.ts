@@ -11,11 +11,25 @@
  */
 
 import { CDPClient } from "./client"
+import { Log } from "@opencode-ai/core/util/log"
+const _cdpLog = Log.create({ service: "cdp-web" })
+function _cdpFmt(a: unknown): string {
+  if (typeof a === "string") return a
+  if (a instanceof Error) return a.message
+  try { return JSON.stringify(a) } catch { return String(a) }
+}
+function dlog(...args: unknown[]): void {
+  _cdpLog.error(args.map(_cdpFmt).join(" "))
+}
+
 
 /* ────────────────────────────────────────────────────────── constants ── */
 const CHATHUB_URL_MARKER = "m365Copilot/Chathub"
-const TIMEOUT_MS = 180_000 // 3 min max wait
-const SETTLE_MS = 2_000   // Wait 2s after isLastUpdate before resolving (catches multi-segment responses)
+// Single backstop: the turn is only considered dead after this long with NO frames of
+// ANY kind (content, progress, isLastUpdate). Reset on every frame, so a slow-but-working
+// turn is never cut off; only a genuinely silent/wedged socket trips it. Normal finish is
+// the authoritative type=2 done=true signal, which arrives in ~2-3s.
+const IDLE_MS = 120_000
 
 /* ────────────────────────────────────────────────── types ── */
 
@@ -81,7 +95,7 @@ export async function enableWsCapture(client: CDPClient): Promise<void> {
   client.on("Network.webSocketCreated", (params: { requestId: string; url: string }) => {
     if (params.url.includes(CHATHUB_URL_MARKER)) {
       state.chathubRequestIds.add(params.requestId)
-      console.error(`[cdp-web ws] tracked Chathub WS: ${params.requestId}`)
+      dlog(`[cdp-web ws] tracked Chathub WS: ${params.requestId}`)
     }
   })
 
@@ -117,19 +131,33 @@ export function awaitResponseWs(client: CDPClient, signal?: AbortSignal): Promis
     let accumulatedText = ""
     let resolved = false
 
-    const timer = setTimeout(() => {
-      if (resolved) return
-      resolved = true
-      state.frameHandler = null
-      if (accumulatedText) resolve(accumulatedText)
-      else reject(new Error("WebSocket response timeout: no frames received within " + TIMEOUT_MS + "ms"))
-    }, TIMEOUT_MS)
+    let idleTimer: ReturnType<typeof setTimeout> | null = null
+
+    // Idle backstop: reset on EVERY frame (content, progress, isLastUpdate — anything).
+    // Fires only after IDLE_MS of complete silence, the real signature of a dead socket,
+    // not a slow turn. Armed immediately so a turn that never emits a single frame still
+    // resolves/rejects eventually rather than hanging forever.
+    const bumpIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer)
+      idleTimer = setTimeout(() => {
+        if (resolved) return
+        dlog(`[cdp-web ws DIAG] idle timeout after ${IDLE_MS}ms of silence (accumLen=${accumulatedText.length})`)
+        if (accumulatedText) {
+          finish()
+        } else {
+          resolved = true
+          state.frameHandler = null
+          reject(new Error("WebSocket response timeout: no frames within " + IDLE_MS + "ms"))
+        }
+      }, IDLE_MS)
+    }
+    bumpIdle()
 
     // Respect caller's AbortSignal
     if (signal) {
       if (signal.aborted) {
         resolved = true
-        clearTimeout(timer)
+        if (idleTimer) clearTimeout(idleTimer)
         state.frameHandler = null
         reject(signal.reason || new Error("Aborted"))
         return
@@ -137,16 +165,15 @@ export function awaitResponseWs(client: CDPClient, signal?: AbortSignal): Promis
       signal.addEventListener("abort", () => {
         if (resolved) return
         resolved = true
-        clearTimeout(timer)
+        if (idleTimer) clearTimeout(idleTimer)
         state.frameHandler = null
         reject(signal.reason || new Error("Aborted"))
       }, { once: true })
     }
 
-    let settleTimer: ReturnType<typeof setTimeout> | null = null
-
     state.frameHandler = (payload: string) => {
       if (resolved) return
+      bumpIdle()
 
       const messages = parseSignalRPayload(payload)
       for (const msg of messages) {
@@ -155,39 +182,55 @@ export function awaitResponseWs(client: CDPClient, signal?: AbortSignal): Promis
           for (const arg of msg.arguments) {
             if (arg.messages) {
               for (const m of arg.messages) {
+                // [SETTLE-DIAG] Log EVERY bot message frame, including ones we
+                // skip, so we can see if a real tool-call tail was filtered out
+                // by isChatContent or arrived after an early resolve.
+                if (m.author === "bot" && m.text) {
+                  dlog(
+                    `[cdp-web ws DIAG] type=1 chatContent=${isChatContent(m)}` +
+                      ` msgType=${m.messageType ?? "-"} origin=${m.contentOrigin ?? "-"}` +
+                      ` turnState=${m.turnState ?? "-"} isLast=${arg.isLastUpdate ?? false}` +
+                      ` textLen=${m.text.length} accumLen=${accumulatedText.length}` +
+                      ` tail=${JSON.stringify(m.text.slice(-60))}`,
+                  )
+                }
                 if (m.author === "bot" && m.text && isChatContent(m)) {
-                  accumulatedText = m.text
-                  // New content arrived — cancel any pending settle timer
-                  if (settleTimer) {
-                    clearTimeout(settleTimer)
-                    settleTimer = null
-                  }
+                  accumulatedText = decodeHtmlEntities(m.text)
                 }
               }
             }
 
-            // isLastUpdate: start a settle window instead of resolving immediately.
-            // If more frames arrive within SETTLE_MS, the timer resets above.
+            // isLastUpdate marks the END OF A SEGMENT, not the turn. It is purely
+            // informational now — the idle timer already runs from the first frame and
+            // resets on every frame, and the authoritative finish is type=2 done=true.
             if (arg.isLastUpdate && accumulatedText) {
-              if (!settleTimer) {
-                settleTimer = setTimeout(() => {
-                  settleTimer = null
-                  finish()
-                }, SETTLE_MS)
-              }
+              dlog(
+                `[cdp-web ws DIAG] isLastUpdate=true (segment end; idle timer runs, awaiting type=2) accumLen=${accumulatedText.length}`,
+              )
             }
           }
         }
 
-        // Type 2: invocation complete — authoritative done signal
+        // Type 2: invocation complete. Only a turnState of "Completed" ends the
+        // turn; any other state is a sub-step — capture its text and keep
+        // listening (the idle net or the next type=2 will finish us).
         if (msg.type === 2 && msg.item) {
           const botMsg = msg.item.messages?.filter(
             m => m.author === "bot" && m.text && isChatContent(m)
           ).pop()
-          if (botMsg?.text) accumulatedText = botMsg.text
-          if (settleTimer) { clearTimeout(settleTimer); settleTimer = null }
-          finish()
-          return
+          const done = msg.item.turnState === "Completed"
+          dlog(
+            `[cdp-web ws DIAG] type=2 invocationComplete done=${done}` +
+              ` itemTurnState=${msg.item.turnState ?? "-"}` +
+              ` botMsgFound=${!!botMsg?.text} botMsgLen=${botMsg?.text?.length ?? 0}` +
+              ` accumLenBefore=${accumulatedText.length}` +
+              ` result=${JSON.stringify(msg.item.result ?? null)}`,
+          )
+          if (botMsg?.text) accumulatedText = decodeHtmlEntities(botMsg.text)
+          if (done) {
+            finish()
+            return
+          }
         }
       }
     }
@@ -195,14 +238,60 @@ export function awaitResponseWs(client: CDPClient, signal?: AbortSignal): Promis
     function finish() {
       if (resolved) return
       resolved = true
-      clearTimeout(timer)
+      if (idleTimer) clearTimeout(idleTimer)
       state!.frameHandler = null
+      dlog(`[cdp-web ws DIAG] RESOLVED with ${accumulatedText.length} chars. tail=${JSON.stringify(accumulatedText.slice(-80))}`)
       resolve(accumulatedText)
     }
   })
 }
 
 /* ────────────────────────────────────────────────── internal ── */
+
+/**
+ * Decode HTML entities that Copilot's SignalR rendering injects into the bot
+ * message text. Copilot HTML-encodes reserved characters (angle brackets,
+ * ampersand, quotes) in its response text, so a tool-call payload the model
+ * emitted with a plain greater-than sign arrives over the wire as its entity
+ * form and no longer matches the real file content. We decode here, at the WS
+ * source, before any JSON parsing downstream.
+ *
+ * Implementation note: every reserved character is built with String.fromChar-
+ * Code and the numeric-entity callback uses the function keyword rather than an
+ * arrow, so this source file is itself immune to the exact corruption it fixes.
+ * Ampersand is decoded LAST so a double-encoded entity collapses by one level
+ * instead of being mangled.
+ */
+function decodeHtmlEntities(text: string): string {
+  if (!text) return text
+  const AMP = String.fromCharCode(38)
+  const LT = String.fromCharCode(60)
+  const GT = String.fromCharCode(62)
+  const QUOT = String.fromCharCode(34)
+  const APOS = String.fromCharCode(39)
+  const SLASH = String.fromCharCode(47)
+  const NBSP = String.fromCharCode(160)
+  let out = text
+  out = out.split(AMP + "lt;").join(LT)
+  out = out.split(AMP + "gt;").join(GT)
+  out = out.split(AMP + "quot;").join(QUOT)
+  out = out.split(AMP + "#39;").join(APOS)
+  out = out.split(AMP + "apos;").join(APOS)
+  out = out.split(AMP + "#x27;").join(APOS)
+  out = out.split(AMP + "#x2F;").join(SLASH)
+  out = out.split(AMP + "#47;").join(SLASH)
+  out = out.split(AMP + "nbsp;").join(NBSP)
+  // Generic numeric decimal entities. Callback uses the function keyword on
+  // purpose (no arrow) to keep this source corruption-proof.
+  out = out.replace(new RegExp(AMP + "#(\\d+);", "g"), function (whole: string, code: string): string {
+    const n = parseInt(code, 10)
+    if (isNaN(n)) return whole
+    return String.fromCharCode(n)
+  })
+  // Ampersand LAST.
+  out = out.split(AMP + "amp;").join(AMP)
+  return out
+}
 
 /**
  * Parse a SignalR WebSocket payload. SignalR uses \x1e (record separator)
