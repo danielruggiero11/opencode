@@ -120,10 +120,20 @@ export async function enableWsCapture(client: CDPClient): Promise<void> {
 }
 
 /**
- * Wait for Copilot's full response via WebSocket frames.
- * Returns the final bot message text (with JSON escaping intact).
+ * Begin capturing Copilot's response via WebSocket frames and return a promise
+ * that resolves with the final bot message text (JSON escaping intact).
+ *
+ * CRITICAL: this installs the frame handler SYNCHRONOUSLY before returning, so
+ * it must be called BEFORE sendPrompt (or right at send time). The CDP frame
+ * listeners registered by enableWsCapture drop any frame that arrives while
+ * `state.frameHandler` is null. If capture only started AFTER the send +
+ * conversation-id wait + settle (the old awaitResponseWs call site), a fast
+ * Copilot reply — including its authoritative type=2 done frame — could stream
+ * through and finish inside that setup window and be discarded entirely, leaving
+ * this promise to hang until the IDLE_MS backstop and fall back to slow DOM
+ * scraping. Arming the handler before the send closes that race window.
  */
-export function awaitResponseWs(client: CDPClient, signal?: AbortSignal): Promise<string> {
+export function beginResponseCapture(client: CDPClient, signal?: AbortSignal): Promise<string> {
   const state = clientState.get(client)
   if (!state) return Promise.reject(new Error("WebSocket capture not enabled. Call enableWsCapture first."))
 
@@ -244,6 +254,15 @@ export function awaitResponseWs(client: CDPClient, signal?: AbortSignal): Promis
       resolve(accumulatedText)
     }
   })
+}
+
+/**
+ * Back-compat wrapper: begins capture at call time. Prefer beginResponseCapture
+ * called BEFORE sendPrompt to avoid the first-turn listen-gap race (see the
+ * beginResponseCapture doc comment).
+ */
+export function awaitResponseWs(client: CDPClient, signal?: AbortSignal): Promise<string> {
+  return beginResponseCapture(client, signal)
 }
 
 /* ────────────────────────────────────────────────── internal ── */

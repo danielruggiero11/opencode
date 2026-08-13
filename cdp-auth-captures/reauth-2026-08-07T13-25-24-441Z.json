@@ -1,0 +1,41 @@
+{
+  "capturedAt": "2026-08-07T13-25-24-441Z",
+  "port": 9224,
+  "results": [
+    {
+      "targetId": "D7192556CA2E4F607C1359CE5752869F",
+      "targetUrl": "https://m365.cloud.microsoft/chat",
+      "targetTitle": "Chat | M365 Copilot",
+      "urlClass": "other",
+      "probe": {
+        "url": "https://m365.cloud.microsoft/chat",
+        "host": "m365.cloud.microsoft",
+        "title": "Chat | M365 Copilot",
+        "readyState": "complete",
+        "classification": "ready",
+        "signals": {
+          "isMsLogin": false,
+          "isMsaLogin": false,
+          "isOkta": false,
+          "isM365": true,
+          "aadEmail": false,
+          "aadPassword": false,
+          "aadNext": false,
+          "pickAccount": false,
+          "oktaForm": false,
+          "sessionExpired": false,
+          "genericDialog": false,
+          "bodyHasReauthWord": false,
+          "dialogHasReauthWord": false,
+          "composer": true,
+          "frameCount": 1
+        },
+        "dialogText": null,
+        "frameSrcs": [
+          "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy"
+        ],
+        "bodySample": "New chat\nSearch\nLibrary\nChats\nPhase 5 Notes Integration\nUnderstanding data.world's Role in Discovery Calls\nMove Provider Quotas Next to Cooldowns\nCDP Copilot Toolset Limitations\nEnhancing Dish UI and Features\nPlan Doc Thoroughness and Accuracy Review\nCoding Agent Tool Call Protocol\nAI Control Tower Meeting Review\nFlow by ServiceNow Overview and Demo\nTech Debt File Feasibility Review\nCDP-Web Sessio"
+      }
+    }
+  ]
+}

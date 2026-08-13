@@ -12,8 +12,12 @@
 export {
   checkAuth,
   checkComposer,
+  checkReauth,
+  clickReauthContinue,
+  type ReauthState,
   openNewChat,
   setEffort,
+  EFFORT_LABELS,
   sendPrompt,
   getTurnCount,
   awaitResponse,
@@ -24,7 +28,7 @@ export {
   CopilotReauthRequired,
 } from "./driver-dom"
 
-export { enableWsCapture, awaitResponseWs } from "./driver-ws"
+export { enableWsCapture, awaitResponseWs, beginResponseCapture } from "./driver-ws"
 
 export {
   getConversationInfo,

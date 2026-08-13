@@ -35,8 +35,11 @@ import {
 import {
   checkAuth,
   checkComposer,
+  checkReauth,
+  clickReauthContinue,
   openNewChat,
   setEffort,
+  EFFORT_LABELS,
   sendPrompt,
   getTurnCount,
   awaitResponse,
@@ -44,7 +47,7 @@ import {
   attachFiles,
   CopilotReauthRequired,
   enableWsCapture,
-  awaitResponseWs,
+  beginResponseCapture,
   waitForConversationId,
   reopenConversation,
   getConversationInfo,
@@ -196,6 +199,46 @@ function getToolNames(options: LanguageModelV3CallOptions): string[] {
 }
 
 /**
+ * INVESTIGATION-ONLY (compaction rollover, step 1). Dumps the full shape of the
+ * incoming model prompt so we can see how opencode's compaction boundary renders
+ * into the AI-SDK messages the provider actually receives. We are hunting for a
+ * durable, detectable signal that "a compaction just happened" — candidates:
+ *   (a) the summary text appearing as the leading user/assistant message,
+ *   (b) any part-level or message-level metadata (e.g. compaction_continue),
+ *   (c) a sudden prompt-length shrink vs. session.messagesSent.
+ * Gated behind CDP_COMPACT_DIAG=1 so it stays silent unless we're capturing.
+ * DELETE THIS once the detection signal is confirmed.
+ */
+function dumpCompactionDiag(tag: string, options: LanguageModelV3CallOptions, extra: Record<string, unknown> = {}): void {
+  if (process.env["CDP_COMPACT_DIAG"] !== "1") return
+  const snip = (s: string, n = 160) => (s.length > n ? s.slice(0, n) + `…(+${s.length - n})` : s)
+  const lines: string[] = []
+  lines.push(`\n──── CDP_COMPACT_DIAG [${tag}] promptLen=${options.prompt.length} ${JSON.stringify(extra)} ────`)
+  options.prompt.forEach((msg, i) => {
+    const m = msg as unknown as Record<string, any>
+    const topKeys = Object.keys(m).filter((k) => k !== "content")
+    const meta = m["metadata"] ?? m["providerOptions"] ?? m["providerMetadata"]
+    lines.push(`  [${i}] role=${m["role"]} keys=${topKeys.join(",")}${meta ? ` meta=${snip(JSON.stringify(meta), 300)}` : ""}`)
+    const content = m["content"]
+    if (typeof content === "string") {
+      lines.push(`       content(str): ${snip(content)}`)
+    } else if (Array.isArray(content)) {
+      content.forEach((part: Record<string, any>, j: number) => {
+        const pKeys = Object.keys(part)
+        const pMeta = part["metadata"] ?? part["providerOptions"] ?? part["providerMetadata"]
+        const detail =
+          part["type"] === "text"
+            ? `text: ${snip(String(part["text"] ?? ""))}`
+            : `keys=${pKeys.join(",")}`
+        lines.push(`       part[${j}] type=${part["type"]} ${detail}${pMeta ? ` meta=${snip(JSON.stringify(pMeta), 200)}` : ""}`)
+      })
+    }
+  })
+  lines.push(`──── /CDP_COMPACT_DIAG [${tag}] ────`)
+  dlog(lines.join("\n"))
+}
+
+/**
  * Distinctive phrases from opencode's built-in SUBAGENT system prompts. The
  * opencode system prompt is carried in options.prompt (even though cdp-web
  * replaces it with its own Copilot preamble), so we can detect the agent here.
@@ -222,6 +265,24 @@ function isTitleTurn(systemContent: string): boolean {
 }
 
 /**
+ * Distinctive phrases from opencode's COMPACTION (summarizer) agent system
+ * prompt. A /compact turn (and auto-overflow) runs this agent, which inherits
+ * the active chat model and therefore lands on THIS Copilot tab. Detecting it
+ * lets us (1) PIN the bound tab instead of rebinding on the changed fingerprint
+ * and (2) send the summarizer instruction as a plain delta rather than the
+ * coding-agent preamble. Detection signal locked from the 2026-08-07 capture.
+ * See docs/cdp-web-unify-and-compact.md Part 0.
+ */
+const COMPACTION_PROMPT_SIGNATURES = [
+  "You are an anchored context summarization assistant",
+  "Summarize only the conversation history you are given",
+]
+
+function isCompactionTurn(systemContent: string): boolean {
+  return COMPACTION_PROMPT_SIGNATURES.some((sig) => systemContent.includes(sig))
+}
+
+/**
  * Decide whether a doGenerate/doStream turn is serving a subagent. Two signals:
  *  1. Temporary/burner sessions: this repo routes every cdp-web subagent
  *     (explore) to the "-temp" model id, while the primary agent uses the
@@ -241,6 +302,31 @@ function isSubagentTurn(_temporary: boolean, systemContent: string): boolean {
   // system-prompt signature (e.g. explore's "You are a file search specialist"),
   // which rides along in options.prompt and never matches the primary agent.
   return SUBAGENT_PROMPT_SIGNATURES.some((sig) => systemContent.includes(sig))
+}
+
+/**
+ * Copilot model names selectable in the mode switcher, in the order we look for
+ * them inside a model id. The FIRST match wins, so more specific names must come
+ * before any that are substrings of another (none currently are). These map 1:1
+ * to EFFORT_LABELS keys in driver-dom.ts.
+ */
+const MODEL_EFFORTS = ["opus", "sonnet"] as const
+
+/**
+ * Resolve which Copilot model/effort to select in the switcher for a given model
+ * id. The model id is the primary signal (per-model selection): `cdp-web/sonnet`
+ * -> "sonnet", `cdp-web/opus-dom` -> "opus". This mirrors how `-temp`/`-dom` are
+ * already parsed from the id. Falls back to the provider-level `configEffort`
+ * (opencode.jsonc options) when the id names no known model, preserving the old
+ * provider-wide behavior for ids like `cdp-web/opus-temp` that don't need it and
+ * for any custom effort value (auto/quick/think).
+ */
+function resolveEffort(modelId: string, configEffort: string): string {
+  const id = modelId.toLowerCase()
+  for (const name of MODEL_EFFORTS) {
+    if (id.includes(name)) return name
+  }
+  return configEffort
 }
 
 /**
@@ -394,6 +480,44 @@ function formatTitleMessage(options: LanguageModelV3CallOptions): string {
     body,
     "</prompt>",
   ].join("\n")
+}
+
+/**
+ * Build the delta message for a COMPACTION turn. Unlike formatInitialMessage
+ * this sends NO coding-agent preamble and NO tool manifest — the Copilot tab
+ * already holds the full conversation server-side, so we send ONLY the
+ * summarizer instruction as a normal follow-up (delta). Copilot then summarizes
+ * what it already has in context; we never re-upload history, so there is no
+ * 128K input-limit risk. The instruction text is pulled verbatim from the
+ * user message(s) in options.prompt (the real summarizer prompt opencode built).
+ */
+const SUMMARIZER_INSTRUCTION_SIGNATURE = "Create a new anchored summary from the conversation history"
+
+function formatCompactionMessage(options: LanguageModelV3CallOptions): string {
+  // Collect user-message texts in order.
+  const userTexts: string[] = []
+  for (const msg of options.prompt) {
+    if (msg.role !== "user") continue
+    const text = Array.isArray(msg.content)
+      ? (msg.content as Array<Record<string, any>>)
+          .filter((p): p is { type: "text"; text: string } => p.type === "text")
+          .map((p) => p.text)
+          .join("")
+      : String(msg.content)
+    const cleaned = stripAttachmentRefs(text).trim()
+    if (cleaned) userTexts.push(cleaned)
+  }
+  // Send ONLY the summarizer instruction (the last user message carrying the
+  // anchored-summary directive). The pinned Copilot tab already holds the full
+  // conversation server-side, so re-injecting earlier user turns (e.g. the
+  // original "What is the time right now?") both duplicates context and, on a
+  // long conversation, risks the 128K input limit the pin is meant to avoid.
+  for (let i = userTexts.length - 1; i >= 0; i--) {
+    if (userTexts[i].includes(SUMMARIZER_INSTRUCTION_SIGNATURE)) return userTexts[i]
+  }
+  // Fallback: no message matched the signature — use just the last user message
+  // rather than concatenating the whole history.
+  return userTexts.length ? userTexts[userTexts.length - 1] : ""
 }
 
 function formatInitialMessage(options: LanguageModelV3CallOptions, dropTask = false): string {
@@ -593,10 +717,23 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
    * Each opencode session gets its own entry in the per-session map, so the
    * primary and explore subagent can run concurrently without stomping state.
    */
-  private async ensureBoundSession(sid: string, fingerprint: string): Promise<SessionState> {
+  private async ensureBoundSession(sid: string, fingerprint: string, isCompaction = false): Promise<SessionState> {
     // If we already have a bound session for this sid with matching fingerprint, reuse it
     const existing = this.sessions.get(sid)
     if (existing && existing.session.systemFingerprint === fingerprint && existing.session.authenticated) {
+      acquireSession(existing.session)
+      return existing.session
+    }
+
+    // COMPACTION PIN (load-bearing): a /compact turn carries a DIFFERENT system
+    // prompt (the summarizer) and NO tools, so its fingerprint never matches the
+    // coding turns. Rebinding here would move to a fresh tab that never saw the
+    // conversation, so Copilot would greet instead of summarize. Reuse the
+    // existing authenticated tab for this sid and IGNORE the fingerprint change
+    // — the history we need to summarize lives on that exact tab. Do NOT update
+    // systemFingerprint, so the next (coding) turn rebinds/deltas normally.
+    if (isCompaction && existing && existing.session.authenticated && existing.session.client) {
+      dlog(`[cdp-web] compaction turn: pinning bound tab for sid=${sid} (conv ${existing.session.conversationId ?? "(none)"}), ignoring fingerprint change`)
       acquireSession(existing.session)
       return existing.session
     }
@@ -653,7 +790,9 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     // so the context-size estimate continues climbing instead of restarting at
     // 0 for this reopened conversation. Only meaningful for a freshly-created
     // SessionState (totals still 0); never clobber an in-flight counter.
-    if (!session.temporary && session.cumulativeInputTokens === 0 && session.cumulativeOutputTokens === 0 && this.loadTokenTotals) {
+    // Part A: runs for BOTH temp and tracked now — temp is "tracked but hidden",
+    // so its context estimate must survive a restart just like tracked.
+    if (session.cumulativeInputTokens === 0 && session.cumulativeOutputTokens === 0 && this.loadTokenTotals) {
       try {
         const totals = await this.loadTokenTotals()
         if (totals) {
@@ -666,10 +805,13 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       }
     }
 
-    // Persistent-chat resume: if this opencode session previously stored a
-    // Copilot conversation GUID, seed it so init reopens that chat instead of
-    // starting a fresh one. This is the /session restart recovery path.
-    if (!session.temporary && !session.conversationId && this.loadConversationRef) {
+    // Conversation resume: if this opencode session previously stored a Copilot
+    // conversation GUID, seed it so init reopens that chat instead of starting a
+    // fresh one. This is the /session restart recovery path.
+    // Part A: runs for BOTH modes now. A temp chat DOES have a real GUID and can
+    // be reopened ("invisible but recoverable"); reopening promotes it to the
+    // navbar, which is acceptable per the product rule (visibility on recovery).
+    if (!session.conversationId && this.loadConversationRef) {
       try {
         const ref = await this.loadConversationRef(); dlog(`[cdp-web] loadConversationRef for ${sid} returned id=${ref?.id ?? "(null)"}`)
         if (ref?.id) {
@@ -825,10 +967,46 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         }
         if (!c) continue
 
+        // If the mid-session reauth popup is still visible on this (now-visible)
+        // tab, auto-click Continue so the user only needs to complete the
+        // Microsoft login/MFA, not hunt for the button. Safe every tick: once
+        // clicked the tab navigates to login and the popup disappears.
+        try {
+          const rp = await checkReauth(c)
+          if (rp.reauth && rp.hasContinue) {
+            dlog("[cdp-web] auth gate: reauth popup on live tab, clicking Continue")
+            await clickReauthContinue(c)
+            await new Promise((r) => setTimeout(r, 1000))
+            continue
+          }
+        } catch {}
+
         const authed = await checkAuth(c)
         if (authed) {
+          // Auth looks good on the main tab — but if a login POPUP window is
+          // still open, the token hasn't actually refreshed yet (the popup
+          // opened when Continue was clicked; it closes itself after the user
+          // finishes login+MFA). Gate on that popup being gone.
+          const targets = await listTargets(port)
+          const loginPopup = targets.find(t =>
+            t.type === "page" &&
+            ((t.url || "").includes("login.microsoftonline.com") || (t.url || "").includes("login.live.com"))
+          )
+          if (loginPopup) {
+            dlog(`[cdp-web] auth gate: checkAuth passed but login popup still open (${loginPopup.url?.slice(0, 80)}) — waiting for it to close`)
+            continue
+          }
+          // Settle: give the main page a moment to receive the token callback
+          // from the just-closed popup before we resume the turn.
+          await new Promise((r) => setTimeout(r, 2000))
+          // Re-verify after settle (token callback may not have landed yet)
+          const stillAuthed = await checkAuth(c).catch(() => false)
+          if (!stillAuthed) {
+            dlog("[cdp-web] auth gate: popup closed but checkAuth failed after settle — continuing to poll")
+            continue
+          }
           session.authenticated = true
-          dlog("[cdp-web] auth gate cleared — user is signed in.")
+          dlog("[cdp-web] auth gate cleared — user is signed in (popup closed, token refreshed).")
           // If we swapped headed just for login, return to headless steady-state.
           await this.restoreHeadlessAfterAuth(session).catch((e) =>
             dlog("[cdp-web] restoreHeadlessAfterAuth failed (continuing):", (e as Error).message),
@@ -1022,12 +1200,28 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     const systemContent = extractSystem(options.prompt)
     const toolNames = getToolNames(options)
     const fingerprint = computeFingerprint(systemContent, toolNames)
+    // INVESTIGATION (compaction rollover step 1): capture the prompt shape for
+    // every turn so a /compact run reveals how the compaction boundary appears
+    // to the provider. Also log the prior session's messagesSent (if this sid is
+    // already bound) so we can see the prompt-length-shrink signal. Silent unless
+    // CDP_COMPACT_DIAG=1. Remove once detection signal is confirmed.
+    dumpCompactionDiag("doGenerate:in", options, {
+      sid,
+      priorMessagesSent: this.sessions.get(sid)?.session.messagesSent ?? null,
+      priorConvId: this.sessions.get(sid)?.session.conversationId ?? null,
+    })
     // Subagent turns (e.g. explore) must not advertise or execute the `task`
     // tool — otherwise a subagent can spawn another subagent, opening a runaway
     // cascade of Copilot tabs. Detected purely inside the provider.
     const isSubagent = isSubagentTurn(this.temporary, systemContent)
+    // A /compact (or auto-overflow) turn runs the summarizer agent, which
+    // inherits the active model and lands on THIS Copilot tab. It must PIN the
+    // already-bound tab (the fingerprint changed, but the history to summarize
+    // lives there) and send the summarizer as a plain delta. See Part 0 of
+    // docs/cdp-web-unify-and-compact.md.
+    const isCompaction = isCompactionTurn(systemContent)
 
-    let session = await this.ensureBoundSession(sid, fingerprint)
+    let session = await this.ensureBoundSession(sid, fingerprint, isCompaction)
 
     try {
       // This turn is activity: re-stamp the temp claim's idle TTL so an actively
@@ -1042,7 +1236,21 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       // the resume path below; declared here so the whole method can see it).
       let resumedExisting = false
 
-      if (!session.initialized || session.messagesSent >= options.prompt.length) {
+      if (isCompaction) {
+        // Compaction turn: the pinned tab already holds the full conversation
+        // server-side. Send ONLY the summarizer instruction as a delta (never a
+        // fresh-start preamble), so Copilot summarizes what it already has. Keep
+        // isInitial false so the init/openNewChat block is skipped and we do NOT
+        // reseed history. If for some reason the tab was never initialized,
+        // degrade gracefully rather than greeting (handled below).
+        messageToSend = formatCompactionMessage(options)
+        isInitial = false
+        if (!messageToSend.trim()) {
+          dlog("[cdp-web] compaction turn had no summarizer instruction text — falling back to delta")
+          messageToSend = formatDeltaMessages(options.prompt, Math.max(0, options.prompt.length - 1))
+        }
+        dlog("[cdp-web] compaction turn: sending summarizer instruction as delta on pinned tab")
+      } else if (!session.initialized || session.messagesSent >= options.prompt.length) {
         messageToSend = isTitleTurn(systemContent)
           ? formatTitleMessage(options)
           : formatInitialMessage(options, isSubagent)
@@ -1070,6 +1278,32 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       // not applied yet); a single failed read here would wrongly re-enter the
       // auth gate and cause the swap cascade. A short retry absorbs that.
       let authed = await checkAuth(client)
+
+      // ─── MID-SESSION REAUTH POPUP GATE ─────────────────────────────────────
+      // Copilot can invalidate the session WITHOUT a URL redirect: it leaves the
+      // composer mounted+enabled and the URL on /chat, then drops an
+      // "Authentication required … Continue" alertdialog over the page (captured
+      // 2026-08-10, cdp-auth-captures/reauth-2026-08-10T12-39-17-611Z.json).
+      // checkAuth's URL/composer heuristics can miss that overlay, so probe for
+      // it explicitly here. If it's up, click Continue to launch Microsoft's
+      // re-auth and fall through to the auth gate (waitForAuth), which polls
+      // until the user is signed back in and then resumes THIS turn. Note: an
+      // embedded login iframe alone is NOT treated as reauth (routine silent SSO
+      // uses it) — only the decisive popup blocks the send.
+      const reauth = await checkReauth(client)
+      if (reauth.reauth) {
+        dlog(`[cdp-web] pre-send: mid-session reauth popup detected (continue=${reauth.hasContinue}, loginFrame=${reauth.loginFrame}) — clicking Continue, entering auth gate`)
+        if (reauth.hasContinue) {
+          await clickReauthContinue(client).catch((e) =>
+            dlog("[cdp-web] clickReauthContinue failed (continuing to auth gate):", (e as Error).message),
+          )
+        }
+        // Surface the on-screen "login required" notice via doStream so the turn
+        // doesn't appear to hang while waitForAuth polls.
+        this.authNoticePending = true
+        authed = false
+      }
+
       if (!authed) {
         for (let attempt = 0; attempt < 5 && !authed; attempt++) {
           await new Promise((r) => setTimeout(r, 1500))
@@ -1089,12 +1323,13 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         if (!client) throw new CDPError("Session has no connected client after reauth")
       }
 
-      // Per-turn drift guard: for an established persistent session, verify the
-      // tab still shows OUR conversation. If it was stolen, idle-reset to /chat,
-      // or navigated elsewhere, force re-init so the reopen block below re-navigates
+      // Per-turn drift guard: for an established session, verify the tab still
+      // shows OUR conversation. If it was stolen, idle-reset to /chat, or
+      // navigated elsewhere, force re-init so the reopen block below re-navigates
       // to our GUID (opening/acquiring a fresh tab if ours is gone). Prevents
       // sending this turn into another session's conversation.
-      if (!isInitial && session.initialized && !session.temporary && session.conversationId) {
+      // Part A: runs for BOTH modes now — temp has a GUID to compare against.
+      if (!isInitial && session.initialized && session.conversationId) {
         const live = await getConversationInfo(client).catch(() => ({ id: null, title: null, url: "" }))
         const claimedByOther = session.targetId ? (await claimedTargetIds(sid)).has(session.targetId) : false
         if (live.id !== session.conversationId || claimedByOther) {
@@ -1125,7 +1360,7 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         // (loaded in ensureBoundSession). Reopen that conversation instead of
         // starting a fresh one, so history/context is preserved across restarts.
         let reopened = false
-        if (!session.temporary && session.conversationId) {
+        if (session.conversationId) {
           // Fast path: if we stole the tab already displaying this conversation
           // (findTabByConversationId), we're on the right page already — no nav.
           const cur = await getConversationInfo(client)
@@ -1173,6 +1408,18 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
                 dlog("[cdp-web] saveConversationRef (adopt) failed:", (e as Error).message),
               )
             }
+          } else if (session.temporary) {
+            // Part A: temp reopen-failure degrade. A temp conversation has a
+            // shorter, undocumented Microsoft TTL, so a stored temp GUID can age
+            // out. Losing a temp conversation is the historical expectation, so
+            // rather than hard-erroring the turn we silently start a FRESH temp
+            // chat (the pre-unification temp behavior). Clear the dead ref so the
+            // openNewChat path below runs and the GUID is re-captured post-send.
+            dlog(`[cdp-web] temp reopen failed for ${failedId} (likely aged out) — degrading to a fresh temp chat`)
+            session.conversationId = null
+            session.conversationTitle = null
+            reopened = false
+            resumedExisting = false
           } else {
             throw new CDPError(
               `cdp-web: could not reopen conversation ${failedId}. ` +
@@ -1189,19 +1436,24 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         dlog("[cdp-web] init nav done, waiting for UI settle before setEffort")
         await new Promise((r) => setTimeout(r, 1500))
 
-        dlog("[cdp-web] setting effort:", this.config.effort)
-        await setEffort(client, this.config.effort)
+        // Per-model selection: derive the Copilot model/effort from THIS model's
+        // id (e.g. cdp-web/sonnet -> "sonnet"), falling back to the provider-level
+        // default. Lets each model id own its switcher target instead of the whole
+        // provider sharing one.
+        const effort = resolveEffort(this.modelId, this.config.effort)
+        dlog("[cdp-web] setting effort:", effort, `(modelId=${this.modelId})`)
+        await setEffort(client, effort)
 
         // Verify effort stuck — Copilot may re-render and reset after navigation
         await new Promise((r) => setTimeout(r, 1000))
         const verifyLabel = await client.evaluate(
           `(document.getElementById('gptModeSwitcher')||{}).innerText||''`,
         ) as string
-        const targetLabel = this.config.effort === "opus" ? "Opus" : this.config.effort
+        const targetLabel = EFFORT_LABELS[effort] ?? effort
         if (verifyLabel && !verifyLabel.toLowerCase().startsWith(targetLabel.toLowerCase())) {
           dlog(`[cdp-web] effort NOT set! Switcher says "${verifyLabel.split("\n")[0]}", retrying...`)
           await new Promise((r) => setTimeout(r, 1000))
-          await setEffort(client, this.config.effort)
+          await setEffort(client, effort)
         }
 
         session.initialized = true
@@ -1287,13 +1539,25 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       const turnsBefore = await getTurnCount(client)
       dlog(`[cdp-web] turnsBefore (pre-send): ${turnsBefore}, isInitial=${isInitial}`)
 
+    // Arm WS capture BEFORE sending. The frame listeners drop any frame that
+    // arrives while no handler is installed, so starting capture here (rather
+    // than after sendPrompt + the ~seconds of GUID-wait/settle below) closes the
+    // first-turn race where a fast Copilot reply — including its type=2 done
+    // frame — would finish inside the setup window and be discarded, causing the
+    // ~2-minute IDLE_MS hang + DOM fallback. See beginResponseCapture doc.
+    const preferWs = !this.modelId.includes("-dom")
+    const wsCapture = preferWs ? beginResponseCapture(client, options.abortSignal) : null
+
     await sendPrompt(client, messageToSend)
     session.messagesSent = options.prompt.length
 
     // For persistent chats, capture the conversation GUID + title on the first
     // turn. Copilot assigns these shortly after the first message is sent.
     // This GUID is the recovery key used to re-open the chat after a timeout.
-    if (!session.temporary && !session.conversationId) {
+    // Part A: runs for BOTH modes now — a temp chat has a real GUID too, and
+    // capturing it (a passive read) is what makes temp "invisible but
+    // recoverable." Capturing does NOT promote the chat; only a send does.
+    if (!session.conversationId) {
         const info = await waitForConversationId(client, 20000)
       if (info.id) {
         session.conversationId = info.id
@@ -1333,12 +1597,12 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
 
       let finalText: string
       let gotViaWs = false
-      const preferWs = !this.modelId.includes("-dom")
 
       if (preferWs) {
-        // WebSocket capture path — SignalR frames have properly escaped JSON
+        // WebSocket capture path — SignalR frames have properly escaped JSON.
+        // Capture was armed before sendPrompt (wsCapture); just await it here.
         try {
-          finalText = await awaitResponseWs(client, options.abortSignal)
+          finalText = await wsCapture!
           gotViaWs = true
           dlog(`[cdp-web ws] response (${finalText.length} chars): ${finalText.slice(0, 200)}`)
         } catch (wsErr) {
@@ -1404,9 +1668,10 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       session.cumulativeOutputTokens += turnOutputTokens
       dlog(`[cdp-web] tokens turn: in=${turnInputTokens} out=${turnOutputTokens} | cumulative: in=${session.cumulativeInputTokens} out=${session.cumulativeOutputTokens}`)
       // Persist the running totals so a /session resume after restart continues
-      // the counter instead of restarting at 0. Best-effort for persistent chats
-      // only; temp chats are disposable so there is nothing to resume.
-      if (!session.temporary && this.saveTokenTotals) {
+      // the counter instead of restarting at 0.
+      // Part A: runs for BOTH modes now — temp is tracked-but-hidden and its
+      // context estimate must survive a restart just like tracked.
+      if (this.saveTokenTotals) {
         await this.saveTokenTotals({
           input: session.cumulativeInputTokens,
           output: session.cumulativeOutputTokens,

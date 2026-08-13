@@ -27,11 +27,12 @@ const TURN_SELECTOR = '[data-testid="m365-chat-llm-web-ui-chat-message"]'
 const COPY_BUTTON = '[data-testid="CopyButtonTestId"]'
 const MARKDOWN_REPLY = '[data-testid="markdown-reply"]'
 
-const EFFORT_LABELS: Record<string, string> = {
+export const EFFORT_LABELS: Record<string, string> = {
   auto: "Auto",
   quick: "Quick response",
   think: "Think deeper",
   opus: "Opus",
+  sonnet: "Sonnet",
 }
 
 export class CopilotReauthRequired extends CDPError {
@@ -62,6 +63,13 @@ export async function checkAuth(client: CDPClient): Promise<boolean> {
       // Session expired modal
       const expired = document.querySelector('[data-testid="session-expired"]');
       if (expired) return 'expired';
+      // Mid-session reauth overlay: composer stays mounted+enabled and the URL
+      // stays on /chat, but an "Authentication required … Continue" alertdialog
+      // blocks the page (see cdp-auth-captures/reauth-2026-08-10). Treat that as
+      // NOT ready so pollers (waitForAuth, waitForReady) don't declare success
+      // while the modal is still up.
+      const reauthDlg = document.querySelector('[role="alertdialog"], [role="dialog"]');
+      if (reauthDlg && /authentication required|authenticate to access this resource|you will need to authenticate/i.test(reauthDlg.innerText || '')) return 'reauth';
       // Check for the composer (means we're good)
       const composer = document.getElementById('${COMPOSER_ID}');
       if (composer) return 'ready';
@@ -88,6 +96,104 @@ export async function checkComposer(client: CDPClient): Promise<boolean> {
       return false;
     })()
   `)
+}
+
+/**
+ * Result of probing the Copilot page for a mid-session reauth prompt.
+ *  - `reauth`      decisive: the "Authentication required" alertdialog is up.
+ *                  This is the block signal the pre-send gate acts on.
+ *  - `signal`      which detector fired ("popup" | "none").
+ *  - `hasContinue` a "Continue" button exists in the dialog that we can click to
+ *                  launch Microsoft's re-auth flow.
+ *  - `loginFrame`  CORROBORATION ONLY. An embedded login.microsoftonline.com /
+ *                  login.live.com iframe is present. Microsoft also uses this
+ *                  frame (idpflag=proxy) for SILENT SSO token refresh during
+ *                  normal operation, so it is deliberately NOT a standalone
+ *                  trigger — blocking on it alone would false-positive and kill
+ *                  legitimate turns. Reported for logging/telemetry only.
+ */
+export interface ReauthState {
+  reauth: boolean
+  signal: "popup" | "none"
+  selector: string | null
+  hasContinue: boolean
+  loginFrame: boolean
+}
+
+/**
+ * Detect a mid-session reauth WITHOUT a URL redirect. Copilot leaves the
+ * composer mounted+enabled and the URL on /chat, then drops an
+ * `[role="alertdialog"]` ("Authentication required … Select 'Continue' to
+ * authenticate your account") over the page. checkAuth's URL/composer heuristics
+ * can't see that overlay, so this probes for it directly. Signal fingerprint
+ * locked from cdp-auth-captures/reauth-2026-08-10T12-39-17-611Z.json.
+ */
+export async function checkReauth(client: CDPClient): Promise<ReauthState> {
+  const raw = await client.evaluate(`
+    (() => {
+      const reauthRe = /authentication required|authenticate to access this resource|you will need to authenticate/i;
+      // PRIMARY (decisive): the reauth alertdialog overlay + its Continue button.
+      const dialogs = [...document.querySelectorAll('[role="alertdialog"], [role="dialog"]')];
+      let popup = null;
+      for (const d of dialogs) {
+        if (!reauthRe.test((d.innerText || '').trim())) continue;
+        const btns = [...d.querySelectorAll('button')];
+        const cont = btns.find(b => /^\\s*continue\\s*$/i.test((b.innerText || '').trim()));
+        popup = {
+          selector: d.getAttribute('role') === 'alertdialog' ? '[role="alertdialog"]' : '[role="dialog"]',
+          hasContinue: !!cont,
+        };
+        break;
+      }
+      // CORROBORATION ONLY: an embedded Microsoft login iframe. Not a trigger on
+      // its own (see ReauthState.loginFrame doc) — routine silent SSO uses it.
+      const frames = [...document.querySelectorAll('iframe')];
+      const loginFrame = frames.some(f => {
+        const s = (f.src || '').toLowerCase();
+        return s.includes('login.microsoftonline.com') || s.includes('login.live.com');
+      });
+      if (popup) return JSON.stringify({ signal: 'popup', selector: popup.selector, hasContinue: popup.hasContinue, loginFrame });
+      return JSON.stringify({ signal: 'none', selector: null, hasContinue: false, loginFrame });
+    })()
+  `)
+  let parsed: { signal: string; selector: string | null; hasContinue: boolean; loginFrame: boolean }
+  try {
+    parsed = JSON.parse(raw || '{"signal":"none","selector":null,"hasContinue":false,"loginFrame":false}')
+  } catch {
+    parsed = { signal: "none", selector: null, hasContinue: false, loginFrame: false }
+  }
+  return {
+    reauth: parsed.signal === "popup",
+    signal: parsed.signal === "popup" ? "popup" : "none",
+    selector: parsed.selector,
+    hasContinue: parsed.hasContinue,
+    loginFrame: parsed.loginFrame,
+  }
+}
+
+/**
+ * Click the "Continue" button inside the reauth alertdialog to launch
+ * Microsoft's re-authentication. Returns true if a Continue button was found and
+ * clicked. Uses a plain DOM .click() (this is a standard Fluent dialog button,
+ * not a Fluent menu, so it does not require synthetic CDP mouse events — same as
+ * the Send button in sendPrompt). After this fires, the tab typically enters the
+ * login navigation storm that waitForAuth() is built to ride out.
+ */
+export async function clickReauthContinue(client: CDPClient): Promise<boolean> {
+  const clicked = await client.evaluate(`
+    (() => {
+      const reauthRe = /authentication required|authenticate to access this resource|you will need to authenticate/i;
+      const dialogs = [...document.querySelectorAll('[role="alertdialog"], [role="dialog"]')];
+      for (const d of dialogs) {
+        if (!reauthRe.test((d.innerText || '').trim())) continue;
+        const btns = [...d.querySelectorAll('button')];
+        const cont = btns.find(b => /^\\s*continue\\s*$/i.test((b.innerText || '').trim()));
+        if (cont) { cont.click(); return true; }
+      }
+      return false;
+    })()
+  `)
+  return clicked === true
 }
 
 /**
@@ -801,10 +907,10 @@ export async function attachFiles(client: CDPClient, filePaths: string[]): Promi
  */
 async function expandProviderSubmenu(client: CDPClient, targetLabel: string): Promise<boolean> {
   // Determine which provider submenu to expand based on the target label
+  // Copilot currently exposes only Opus and Sonnet under the Claude submenu.
   const providerForLabel: Record<string, string> = {
     opus: "claude",
     sonnet: "claude",
-    haiku: "claude",
     "gpt-4o": "gpt",
     "gpt-4": "gpt",
     "o1": "gpt",

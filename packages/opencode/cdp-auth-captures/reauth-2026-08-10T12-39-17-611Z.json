@@ -1,0 +1,427 @@
+{
+  "capturedAt": "2026-08-10T12-39-17-611Z",
+  "port": 9224,
+  "watchSeconds": 6,
+  "results": [
+    {
+      "targetId": "7B0A658AE3324513CE8DBE962E025F1E",
+      "targetType": "page",
+      "targetUrl": "https://m365.cloud.microsoft/chat",
+      "targetTitle": "Chat | M365 Copilot",
+      "urlClass": "copilot",
+      "snapshotA": {
+        "url": "https://m365.cloud.microsoft/chat",
+        "host": "m365.cloud.microsoft",
+        "title": "Chat | M365 Copilot",
+        "readyState": "complete",
+        "classification": "reauth-popup",
+        "signals": {
+          "isMsLogin": false,
+          "isMsaLogin": false,
+          "isOkta": false,
+          "isM365": true,
+          "aadEmail": false,
+          "aadPassword": false,
+          "aadNext": false,
+          "pickAccount": false,
+          "oktaForm": false,
+          "sessionExpired": false,
+          "genericDialog": true,
+          "bodyHasReauthWord": true,
+          "dialogHasReauthWord": true,
+          "composer": true,
+          "composerEnabled": true,
+          "frameCount": 1
+        },
+        "dialogText": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+        "reauthPopups": [
+          {
+            "matched": true,
+            "role": "alertdialog",
+            "text": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+            "buttons": [
+              "Continue"
+            ],
+            "selector": "html > body > div > div[role=\"alertdialog\"]",
+            "zIndex": 0
+          }
+        ],
+        "popups": [
+          {
+            "matched": true,
+            "role": "alertdialog",
+            "text": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+            "buttons": [
+              "Continue"
+            ],
+            "selector": "html > body > div > div[role=\"alertdialog\"]",
+            "zIndex": 0
+          }
+        ],
+        "frameSrcs": [
+          "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy"
+        ],
+        "bodySample": "New chat\nSearch\nLibrary\nChats\nStart Working on cdp-web-unify-and-compact.md\nCollaborative Work Management Mobile Status\nPresentation Notes Abstraction Continuation\nAC Troubleshooting and Next Steps\nGospel Presentation Feedback for Children\nPhase 5 Notes Integration\nUnderstanding data.world's Role in Discovery Calls\nMove Provider Quotas Next to Cooldowns\nCDP Copilot Toolset Limitations\nEnhancing Di"
+      },
+      "frameTree": {
+        "url": "https://m365.cloud.microsoft/chat",
+        "name": null,
+        "securityOrigin": "https://m365.cloud.microsoft",
+        "childFrames": []
+      },
+      "snapshotB": {
+        "url": "https://m365.cloud.microsoft/chat",
+        "host": "m365.cloud.microsoft",
+        "title": "Chat | M365 Copilot",
+        "readyState": "complete",
+        "classification": "reauth-popup",
+        "signals": {
+          "isMsLogin": false,
+          "isMsaLogin": false,
+          "isOkta": false,
+          "isM365": true,
+          "aadEmail": false,
+          "aadPassword": false,
+          "aadNext": false,
+          "pickAccount": false,
+          "oktaForm": false,
+          "sessionExpired": false,
+          "genericDialog": true,
+          "bodyHasReauthWord": true,
+          "dialogHasReauthWord": true,
+          "composer": true,
+          "composerEnabled": true,
+          "frameCount": 1
+        },
+        "dialogText": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+        "reauthPopups": [
+          {
+            "matched": true,
+            "role": "alertdialog",
+            "text": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+            "buttons": [
+              "Continue"
+            ],
+            "selector": "html > body > div > div[role=\"alertdialog\"]",
+            "zIndex": 0
+          }
+        ],
+        "popups": [
+          {
+            "matched": true,
+            "role": "alertdialog",
+            "text": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+            "buttons": [
+              "Continue"
+            ],
+            "selector": "html > body > div > div[role=\"alertdialog\"]",
+            "zIndex": 0
+          }
+        ],
+        "frameSrcs": [
+          "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy"
+        ],
+        "bodySample": "New chat\nSearch\nLibrary\nChats\nStart Working on cdp-web-unify-and-compact.md\nCollaborative Work Management Mobile Status\nPresentation Notes Abstraction Continuation\nAC Troubleshooting and Next Steps\nGospel Presentation Feedback for Children\nPhase 5 Notes Integration\nUnderstanding data.world's Role in Discovery Calls\nMove Provider Quotas Next to Cooldowns\nCDP Copilot Toolset Limitations\nEnhancing Di"
+      },
+      "contextProbes": [
+        {
+          "context": {
+            "id": 1,
+            "origin": "https://m365.cloud.microsoft",
+            "name": "",
+            "frameId": "7B0A658AE3324513CE8DBE962E025F1E"
+          },
+          "probe": {
+            "url": "https://m365.cloud.microsoft/chat",
+            "host": "m365.cloud.microsoft",
+            "title": "Chat | M365 Copilot",
+            "readyState": "complete",
+            "classification": "reauth-popup",
+            "signals": {
+              "isMsLogin": false,
+              "isMsaLogin": false,
+              "isOkta": false,
+              "isM365": true,
+              "aadEmail": false,
+              "aadPassword": false,
+              "aadNext": false,
+              "pickAccount": false,
+              "oktaForm": false,
+              "sessionExpired": false,
+              "genericDialog": true,
+              "bodyHasReauthWord": true,
+              "dialogHasReauthWord": true,
+              "composer": true,
+              "composerEnabled": true,
+              "frameCount": 1
+            },
+            "dialogText": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+            "reauthPopups": [
+              {
+                "matched": true,
+                "role": "alertdialog",
+                "text": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+                "buttons": [
+                  "Continue"
+                ],
+                "selector": "html > body > div > div[role=\"alertdialog\"]",
+                "zIndex": 0
+              }
+            ],
+            "popups": [
+              {
+                "matched": true,
+                "role": "alertdialog",
+                "text": "Authentication required\nYou will need to authenticate to access this resource. Select 'Continue' to authenticate your account.\nContinue",
+                "buttons": [
+                  "Continue"
+                ],
+                "selector": "html > body > div > div[role=\"alertdialog\"]",
+                "zIndex": 0
+              }
+            ],
+            "frameSrcs": [
+              "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy"
+            ],
+            "bodySample": "New chat\nSearch\nLibrary\nChats\nStart Working on cdp-web-unify-and-compact.md\nCollaborative Work Management Mobile Status\nPresentation Notes Abstraction Continuation\nAC Troubleshooting and Next Steps\nGospel Presentation Feedback for Children\nPhase 5 Notes Integration\nUnderstanding data.world's Role in Discovery Calls\nMove Provider Quotas Next to Cooldowns\nCDP Copilot Toolset Limitations\nEnhancing Di"
+          }
+        }
+      ],
+      "network": []
+    },
+    {
+      "targetId": "90A3251D5B6D1D556AEA464124F3267C",
+      "targetType": "iframe",
+      "targetUrl": "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy",
+      "targetTitle": "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&amp;appid=4765445b-32c6-49b0-83e6-1d93765276ca&amp;idpflag=proxy",
+      "urlClass": "login",
+      "snapshotA": {
+        "url": "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy",
+        "host": "login.microsoftonline.com",
+        "title": "User Data",
+        "readyState": "complete",
+        "classification": "ms-login",
+        "signals": {
+          "isMsLogin": true,
+          "isMsaLogin": false,
+          "isOkta": false,
+          "isM365": false,
+          "aadEmail": false,
+          "aadPassword": false,
+          "aadNext": false,
+          "pickAccount": false,
+          "oktaForm": false,
+          "sessionExpired": false,
+          "genericDialog": false,
+          "bodyHasReauthWord": false,
+          "dialogHasReauthWord": false,
+          "composer": false,
+          "composerEnabled": false,
+          "frameCount": 1
+        },
+        "dialogText": null,
+        "reauthPopups": [],
+        "popups": [],
+        "frameSrcs": [
+          "https://login.live.com/Me.srf?wa=wsignin1.0&idpflag=indirect&id=12&wreply=https%3a%2f%2flogin.microsoftonline.com&owreply=https%3a%2f%2fm365.cloud.microsoft"
+        ],
+        "bodySample": "\n    \n        function getPerformanceObjectData(object)\n        {\n            var result = {};\n\n            if (!object)\n            {\n                return result;\n            }\n\n            // In some browsers, some of the PerformanceTiming objects have a native toJSON method\n            // that returns a JS object with all of the properties of the PerformanceTiming object.\n            if (obje"
+      },
+      "frameTree": {
+        "url": "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy",
+        "name": null,
+        "securityOrigin": "https://login.microsoftonline.com",
+        "childFrames": []
+      },
+      "snapshotB": {
+        "url": "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy",
+        "host": "login.microsoftonline.com",
+        "title": "User Data",
+        "readyState": "complete",
+        "classification": "ms-login",
+        "signals": {
+          "isMsLogin": true,
+          "isMsaLogin": false,
+          "isOkta": false,
+          "isM365": false,
+          "aadEmail": false,
+          "aadPassword": false,
+          "aadNext": false,
+          "pickAccount": false,
+          "oktaForm": false,
+          "sessionExpired": false,
+          "genericDialog": false,
+          "bodyHasReauthWord": false,
+          "dialogHasReauthWord": false,
+          "composer": false,
+          "composerEnabled": false,
+          "frameCount": 1
+        },
+        "dialogText": null,
+        "reauthPopups": [],
+        "popups": [],
+        "frameSrcs": [
+          "https://login.live.com/Me.srf?wa=wsignin1.0&idpflag=indirect&id=12&wreply=https%3a%2f%2flogin.microsoftonline.com&owreply=https%3a%2f%2fm365.cloud.microsoft"
+        ],
+        "bodySample": "\n    \n        function getPerformanceObjectData(object)\n        {\n            var result = {};\n\n            if (!object)\n            {\n                return result;\n            }\n\n            // In some browsers, some of the PerformanceTiming objects have a native toJSON method\n            // that returns a JS object with all of the properties of the PerformanceTiming object.\n            if (obje"
+      },
+      "contextProbes": [
+        {
+          "context": {
+            "id": 5,
+            "origin": "https://login.microsoftonline.com",
+            "name": "",
+            "frameId": "90A3251D5B6D1D556AEA464124F3267C"
+          },
+          "probe": {
+            "url": "https://login.microsoftonline.com/savedusers?wreply=https%3A%2F%2Fm365.cloud.microsoft&appid=4765445b-32c6-49b0-83e6-1d93765276ca&idpflag=proxy",
+            "host": "login.microsoftonline.com",
+            "title": "User Data",
+            "readyState": "complete",
+            "classification": "ms-login",
+            "signals": {
+              "isMsLogin": true,
+              "isMsaLogin": false,
+              "isOkta": false,
+              "isM365": false,
+              "aadEmail": false,
+              "aadPassword": false,
+              "aadNext": false,
+              "pickAccount": false,
+              "oktaForm": false,
+              "sessionExpired": false,
+              "genericDialog": false,
+              "bodyHasReauthWord": false,
+              "dialogHasReauthWord": false,
+              "composer": false,
+              "composerEnabled": false,
+              "frameCount": 1
+            },
+            "dialogText": null,
+            "reauthPopups": [],
+            "popups": [],
+            "frameSrcs": [
+              "https://login.live.com/Me.srf?wa=wsignin1.0&idpflag=indirect&id=12&wreply=https%3a%2f%2flogin.microsoftonline.com&owreply=https%3a%2f%2fm365.cloud.microsoft"
+            ],
+            "bodySample": "\n    \n        function getPerformanceObjectData(object)\n        {\n            var result = {};\n\n            if (!object)\n            {\n                return result;\n            }\n\n            // In some browsers, some of the PerformanceTiming objects have a native toJSON method\n            // that returns a JS object with all of the properties of the PerformanceTiming object.\n            if (obje"
+          }
+        }
+      ],
+      "network": []
+    },
+    {
+      "targetId": "17472118C99B4CD25DF6713BA3237637",
+      "targetType": "iframe",
+      "targetUrl": "https://login.live.com/Me.srf?wa=wsignin1.0&idpflag=indirect&id=12&wreply=https%3a%2f%2flogin.microsoftonline.com&owreply=https%3a%2f%2fm365.cloud.microsoft",
+      "targetTitle": "https://login.live.com/Me.srf?wa=wsignin1.0&amp;idpflag=indirect&amp;id=12&amp;wreply=https%3a%2f%2flogin.microsoftonline.com&amp;owreply=https%3a%2f%2fm365.cloud.microsoft",
+      "urlClass": "login",
+      "snapshotA": {
+        "url": "https://login.live.com/Me.srf?wa=wsignin1.0&idpflag=indirect&id=12&wreply=https%3a%2f%2flogin.microsoftonline.com&owreply=https%3a%2f%2fm365.cloud.microsoft",
+        "host": "login.live.com",
+        "title": "Windows Live ID",
+        "readyState": "complete",
+        "classification": "ms-login",
+        "signals": {
+          "isMsLogin": false,
+          "isMsaLogin": true,
+          "isOkta": false,
+          "isM365": false,
+          "aadEmail": false,
+          "aadPassword": false,
+          "aadNext": false,
+          "pickAccount": false,
+          "oktaForm": false,
+          "sessionExpired": false,
+          "genericDialog": false,
+          "bodyHasReauthWord": false,
+          "dialogHasReauthWord": false,
+          "composer": false,
+          "composerEnabled": false,
+          "frameCount": 0
+        },
+        "dialogText": null,
+        "reauthPopups": [],
+        "popups": [],
+        "frameSrcs": [],
+        "bodySample": ""
+      },
+      "frameTree": {
+        "url": "https://login.live.com/Me.srf?wa=wsignin1.0&idpflag=indirect&id=12&wreply=https%3a%2f%2flogin.microsoftonline.com&owreply=https%3a%2f%2fm365.cloud.microsoft",
+        "name": null,
+        "securityOrigin": "https://login.live.com",
+        "childFrames": []
+      },
+      "snapshotB": {
+        "url": "https://login.live.com/Me.srf?wa=wsignin1.0&idpflag=indirect&id=12&wreply=https%3a%2f%2flogin.microsoftonline.com&owreply=https%3a%2f%2fm365.cloud.microsoft",
+        "host": "login.live.com",
+        "title": "Windows Live ID",
+        "readyState": "complete",
+        "classification": "ms-login",
+        "signals": {
+          "isMsLogin": false,
+          "isMsaLogin": true,
+          "isOkta": false,
+          "isM365": false,
+          "aadEmail": false,
+          "aadPassword": false,
+          "aadNext": false,
+          "pickAccount": false,
+          "oktaForm": false,
+          "sessionExpired": false,
+          "genericDialog": false,
+          "bodyHasReauthWord": false,
+          "dialogHasReauthWord": false,
+          "composer": false,
+          "composerEnabled": false,
+          "frameCount": 0
+        },
+        "dialogText": null,
+        "reauthPopups": [],
+        "popups": [],
+        "frameSrcs": [],
+        "bodySample": ""
+      },
+      "contextProbes": [
+        {
+          "context": {
+            "id": 5,
+            "origin": "https://login.live.com",
+            "name": "",
+            "frameId": "17472118C99B4CD25DF6713BA3237637"
+          },
+          "probe": {
+            "url": "https://login.live.com/Me.srf?wa=wsignin1.0&idpflag=indirect&id=12&wreply=https%3a%2f%2flogin.microsoftonline.com&owreply=https%3a%2f%2fm365.cloud.microsoft",
+            "host": "login.live.com",
+            "title": "Windows Live ID",
+            "readyState": "complete",
+            "classification": "ms-login",
+            "signals": {
+              "isMsLogin": false,
+              "isMsaLogin": true,
+              "isOkta": false,
+              "isM365": false,
+              "aadEmail": false,
+              "aadPassword": false,
+              "aadNext": false,
+              "pickAccount": false,
+              "oktaForm": false,
+              "sessionExpired": false,
+              "genericDialog": false,
+              "bodyHasReauthWord": false,
+              "dialogHasReauthWord": false,
+              "composer": false,
+              "composerEnabled": false,
+              "frameCount": 0
+            },
+            "dialogText": null,
+            "reauthPopups": [],
+            "popups": [],
+            "frameSrcs": [],
+            "bodySample": ""
+          }
+        }
+      ],
+      "network": []
+    }
+  ]
+}
