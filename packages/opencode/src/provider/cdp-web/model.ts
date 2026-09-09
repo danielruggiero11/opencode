@@ -21,6 +21,7 @@ import {
 } from "@ai-sdk/provider"
 import { parseResponse } from "./parse"
 import { parseResponse as parseResponseClean } from "../shim/parse"
+import { htmlEscapeEnabled, escapeHtmlPayload } from "./html-escape"
 import { countTokens } from "../shim/tokenizer"
 import {
   createSession,
@@ -51,11 +52,17 @@ import {
   waitForConversationId,
   reopenConversation,
   getConversationInfo,
+  waitForWordShell,
+  resolveCopilotFrame,
+  installEnvelopeRewrite,
+  wordOpenNewChat,
+  wordOpenTempChat,
 } from "./driver"
 import { extractFilePathsFromText } from "./extract-paths"
-import { CDPClient, CDPError, findCopilotTabs, listTargets, createTabViaCDP } from "./client"
+import { CDPClient, CDPError, findCopilotTabs, findWordTabs, listTargets, createTabViaCDP } from "./client"
 import { ensureBrowser, openCopilotTab, closeBrowser, getLaunchedHeadless } from "./browser"
 import { claimedGuids, writeClaim, releaseClaim, claimedTargetIds, writeTargetClaim, touchTargetClaim } from "./claims"
+import { loadTabAffinity, saveTabAffinity, clearTabAffinity } from "./affinity"
 import path from "path"
 import os from "os"
 import { existsSync } from "fs"
@@ -91,6 +98,24 @@ interface CDPWebModelConfig {
   profileDir?: string
   /** Optional --profile-directory (e.g. "Default") within that User Data root. */
   profileDirectory?: string
+  /**
+   * Word engine only (model id carries a "-word" suffix). The parking-doc URL
+   * whose embedded Copilot ("Chat with Copilot") pane we drive. Word routes
+   * Copilot through its own token allocation, which is why we prefer it. Required
+   * for the word engine; ignored by the m365 (web) engine.
+   */
+  wordUrl?: string
+  /**
+   * Word engine only. Optional separate CDP port/browser for the Word tab.
+   * Falls back to `port` when omitted (shared browser => shared auth).
+   */
+  wordPort?: number
+  /**
+   * Word engine only. Re-inject a short coding-agent reminder into a delta
+   * message every this-many cumulative tokens of conversation (see the
+   * reminder-injection block in doGenerate). Default 35,000.
+   */
+  reminderTokenInterval?: number
 }
 
 /**
@@ -142,6 +167,18 @@ function copilotPreamble(workspaceRoot: string, manifestPath: string | null): st
     '  {"type":"tool_call","name":"grep","id":"g1","input":{"pattern":"meeting","include":"*.py"}}',
     '  {"type":"tool_call","name":"glob","id":"g2","input":{"pattern":"**/*notes*"}}',
     '- If calls depend on each other, do them one at a time. Wait for my result before continuing.',
+    '',
+    'MARKUP ENCODING (CRITICAL for edit/write to work):',
+    '- In file contents I show you, HTML-special characters are ESCAPED as entities:',
+    '  a less-than sign appears as `&lt;`, a greater-than sign as `&gt;`, an ampersand as `&amp;`.',
+    '- Example: an HTML script tag that literally exists in a file is shown to you as',
+    '  `&lt;script src="x"&gt;&lt;/script&gt;` (its angle brackets rendered as entities).',
+    '- When you emit `oldString`, `newString`, or file `content` in a tool call, reproduce these',
+    '  entities EXACTLY as shown — keep `&lt;` / `&gt;` / `&amp;` verbatim. Do NOT convert them',
+    '  back to raw angle brackets or ampersands.',
+    '- WHY: your response travels through a channel that strips raw HTML tags. Raw angle-bracket',
+    '  markup in your output is silently mangled and the edit will fail to match; entity-escaped',
+    '  text passes through intact and I decode it to real characters before writing to disk.',
     ...(manifestPath
       ? [
           '',
@@ -548,10 +585,49 @@ function formatInitialMessage(options: LanguageModelV3CallOptions, dropTask = fa
   return sections.join("\n\n")
 }
 
+/**
+ * Word engine only. Rebuilds the SAME preamble + tool manifest as
+ * formatInitialMessage — pulled fresh from `options` each call, so this never
+ * goes stale if the tool list changes mid-conversation — but framed as a
+ * re-assertion rather than a fresh start, and WITHOUT the "# Task" section
+ * (the actual delta already carries the real task/turn right after this).
+ * See formatInitialMessage for why turn 0's framing needs periodic repeating:
+ * Copilot sends only a delta after turn 0 and can shrink/summarize away the
+ * original preamble on long conversations, so a stripped-down "you're a
+ * coding agent" nudge with no tool definitions would leave the model unable
+ * to act on it even if it landed.
+ */
+function formatReminderMessage(options: LanguageModelV3CallOptions, dropTask = false): string {
+  const systemText = extractSystem(options.prompt)
+  const workspaceRoot = extractWorkspaceRoot(systemText)
+  const manifestPath = findManifestFile(workspaceRoot)
+  const preamble = copilotPreamble(workspaceRoot, manifestPath)
+  const tools = toolsBlock(options, workspaceRoot, dropTask)
+  const sections: string[] = [
+    "[Reminder — re-asserting your original instructions, unchanged, in case earlier context was trimmed. " +
+      "You are still the coding agent below, not Word's document-drafting assistant. Your next message follows " +
+      "immediately after this block; treat it as the next turn in the SAME task, not a new conversation.]",
+    preamble,
+  ]
+  if (tools) sections.push(tools)
+  return sections.join("\n\n")
+}
+
 /** Max chars for a single delta message sent to Copilot (leaves headroom from 128K limit) */
 const DELTA_CHAR_BUDGET = 100_000
 /** Max chars for a single tool result before truncation */
 const SINGLE_RESULT_MAX = 80_000
+
+/**
+ * One-line reminder appended to a tool result whose content was entity-escaped
+ * (i.e. it contained `<`, `>`, or `&`). Placed next to the escaped bytes so the
+ * preamble's MARKUP ENCODING rule is fresh when the model builds an edit/write
+ * that echoes them. See html-escape.ts and copilotPreamble.
+ */
+const MARKUP_REMINDER =
+  "[note: markup above is entity-escaped (&lt; &gt; &amp;) — reproduce those entities " +
+  "verbatim in oldString/newString/content; do not convert them back to raw angle brackets or ampersands]"
+
 
 function truncateResult(text: string, max: number): string {
   if (text.length <= max) return text
@@ -598,15 +674,24 @@ function formatDeltaMessages(prompt: LanguageModelV3CallOptions["prompt"], start
             }>
           ).map((p) => {
               const out = p.output as { type?: string; value?: unknown } | undefined
-              const val =
+              const rawVal =
                 out?.type === "text" && typeof out.value === "string"
                   ? out.value
                   : out?.value !== undefined
                     ? JSON.stringify(out.value)
                     : JSON.stringify(out ?? p)
+              // Entity-escape the payload so Copilot's HTML sanitizer cannot dismantle
+              // markup (e.g. `<script>`) before the model reads it. Decoded back at the
+              // WS source (driver-ws decodeHtmlEntities). See html-escape.ts.
+              const val = htmlEscapeEnabled() ? escapeHtmlPayload(rawVal) : rawVal
               const label = p.toolName ?? p.toolCallId ?? "tool"
               const status = p.isError ? "ERROR" : "OK"
-              return `[${label} → ${status}]\n${val}`
+              // When escaping actually changed this result (it contained < > or &), append
+              // a short reminder RIGHT HERE — next to the bytes the model may echo into an
+              // edit/write — so the preamble's markup rule is fresh at the moment it matters.
+              // Plain-text results are untouched (no overhead where the bug can't bite).
+              const reminder = val !== rawVal ? `\n${MARKUP_REMINDER}` : ""
+              return `[${label} → ${status}]\n${val}${reminder}`
             })
         : []
 
@@ -641,6 +726,15 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
    * ids (e.g. "opus" and "opus-temp") and flip between them with /model.
    */
   private readonly temporary: boolean
+  /**
+   * Which Copilot surface this model instance drives, decoded once from the
+   * model id (mirrors the existing "-temp"/"-dom" parsing). A "-word" suffix
+   * (e.g. "cdp-web/opus-word") selects the Word Online engine, which drives the
+   * BizChat pane embedded in a Word parking doc through Word's token allocation;
+   * anything else is the default m365 chat engine. Everything downstream (target
+   * URL, tab filter, OOPIF auto-attach) branches on this.
+   */
+  private readonly engine: "word" | "m365"
   /**
    * Per-opencode-session state map. Since core caches one CDPWebLanguageModel
    * instance per model id, and the primary + explore subagent can share the same
@@ -693,6 +787,36 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     // Mode is driven entirely by the model id: "-temp" suffix => temporary,
     // any other id => persistent. No provider-level default.
     this.temporary = modelId.includes("-temp")
+    // Engine is likewise decoded from the id: "-word" => Word Online engine.
+    this.engine = modelId.includes("-word") ? "word" : "m365"
+  }
+
+  /**
+   * The CDP port this model instance should use. For the word engine, prefer the
+   * configured `wordPort` (optional separate browser for Word) and fall back to
+   * the shared `port`. For the m365 engine this is always `port`.
+   */
+  private enginePort(): number {
+    return this.engine === "word" ? (this.config.wordPort ?? this.config.port) : this.config.port
+  }
+
+  /**
+   * The tab/target URL to open or adopt for this engine. m365 => the Copilot
+   * chat surface; word => the user-configured parking-doc URL (whose embedded
+   * Copilot pane we drive). Throws for the word engine if no wordUrl is set,
+   * since there is no sensible default parking doc.
+   */
+  private engineTargetUrl(): string {
+    if (this.engine === "word") {
+      if (!this.config.wordUrl) {
+        throw new CDPError(
+          "cdp-web word engine: no wordUrl configured. Set the provider option " +
+            '"wordUrl" to a Word Online parking-doc URL (opened through action=edit).',
+        )
+      }
+      return this.config.wordUrl
+    }
+    return "https://m365.cloud.microsoft/chat"
   }
 
   private metadata(): SharedV3ProviderMetadata {
@@ -709,6 +833,9 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     if (!entry) return
     this.sessions.delete(sid)
     dlog(`[cdp-web] releaseSessionForSid: destroying session for sid=${sid} (conv=${entry.session.conversationId ?? "(none)"})`)
+    // Its tab is going away, so any Word tab-affinity record for this sid is now
+    // stale — forget it (validated-against-live anyway, this is just tidiness).
+    if (this.engine === "word") await clearTabAffinity(sid).catch(() => {})
     await destroySession(entry.session.id)
   }
 
@@ -740,18 +867,37 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
 
     if (existing) dlog(`[cdp-web] rebinding sid=${sid}: fingerprint changed or session not authenticated, was on conv ${existing.session.conversationId ?? "(none)"}`)
     const prevConvId = existing?.session.conversationId ?? null
-    const port = await ensureBrowser({ port: this.config.port, headless: this.config.headless, browser: this.config.browser, profileDir: this.config.profileDir, profileDirectory: this.config.profileDirectory })
+    // The word engine may run on a separate CDP port/browser (wordPort); it
+    // falls back to the shared port when unset, so a single browser+profile
+    // serves both engines and shares auth.
+    const port = await ensureBrowser({ port: this.enginePort(), headless: this.config.headless, browser: this.config.browser, profileDir: this.config.profileDir, profileDirectory: this.config.profileDirectory })
 
     // First, try to find an existing Copilot tab that's already open
     // (e.g., the one opened by the browser launch itself)
     const session = createSession(fingerprint, this.temporary)
-    const existingTab = await this.findUsableTab(port, sid, prevConvId)
+
+    // Word resume signal: if this sid has a tab-affinity record, we've bound it
+    // to a Word tab before → this turn is a RESUME, so word init must CONTINUE
+    // the pane's current conversation in place rather than clicking New Chat and
+    // wiping it. A brand-new sid (no record) gets a clean chat. This is what makes
+    // the manual-recovery flow ("open the tab, navigate to the conversation, open
+    // opencode to the right session, continue") pick up like we never left.
+    if (this.engine === "word" && sid) {
+      session.resumeInPlace = !!(await loadTabAffinity(sid))
+      if (session.resumeInPlace) dlog(`[cdp-web word] sid=${sid} has tab affinity — resuming conversation in place (no new chat)`)
+    }
+
+    const existingTab = await this.findUsableTab(
+      port,
+      sid,
+      this.engine === "word" ? undefined : prevConvId,
+    )
 
     if (existingTab) {
       session.targetId = existingTab.id
       acquireSession(session)
       const wsUrl = existingTab.webSocketDebuggerUrl!.replace("localhost", "127.0.0.1")
-      await connectSession(session, wsUrl)
+      await connectSession(session, wsUrl, { autoAttach: this.engine === "word" })
     } else {
       // No usable existing tab — open a genuinely NEW tab. Never hijack a tab
       // another live session claims. Prefer the reliable browser-level
@@ -759,7 +905,9 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       // must NOT be in the live claimed-target set before we drive it.
       dlog("[cdp-web] no usable existing tab — creating a new one")
       const claimedNow = await claimedTargetIds()
-      let tab = await createTabViaCDP(port, "https://m365.cloud.microsoft/chat")
+      // Engine-aware target: m365 => Copilot chat surface; word => the
+      // configured parking-doc URL whose embedded Copilot pane we drive.
+      let tab = await createTabViaCDP(port, this.engineTargetUrl())
       if (!tab || !tab.webSocketDebuggerUrl || claimedNow.has(tab.id)) {
         dlog(`[cdp-web] createTabViaCDP unusable (got=${tab?.id ?? "null"} claimed=${tab ? claimedNow.has(tab.id) : false}) — trying openCopilotTab`)
         tab = await openCopilotTab(port)
@@ -775,15 +923,25 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       acquireSession(session)
       await new Promise((r) => setTimeout(r, 3000))
       const wsUrl = tab.webSocketDebuggerUrl.replace("localhost", "127.0.0.1")
-      await connectSession(session, wsUrl)
+      await connectSession(session, wsUrl, { autoAttach: this.engine === "word" })
     }
 
-    // Now wait for authentication to complete
-    await this.waitForAuth(session)
+    // Now wait for authentication / readiness. The m365 engine polls the flat
+    // page's composer (waitForAuth). The word engine instead waits for the Word
+    // editor shell, opens the Copilot pane, and resolves the Copilot OOPIF —
+    // ensureWordFrame — because auth + the composer live inside that frame, not
+    // the top document.
+    if (this.engine === "word") {
+      await this.ensureWordFrame(session)
+    } else {
+      await this.waitForAuth(session)
+    }
 
-    // Enable WebSocket capture for the WS path (non-dom model IDs)
+    // Enable WebSocket capture for the WS path (non-dom model IDs). For word, the
+    // Chathub socket lives inside the Copilot OOPIF, so Network must be enabled
+    // on every attached session, not just the top target.
     if (!this.modelId.includes("-dom") && session.client) {
-      await enableWsCapture(session.client)
+      await enableWsCapture(session.client, { allSessions: this.engine === "word" })
     }
 
     // Token-counter resume: seed the cumulative totals from persisted metadata
@@ -811,7 +969,7 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     // Part A: runs for BOTH modes now. A temp chat DOES have a real GUID and can
     // be reopened ("invisible but recoverable"); reopening promotes it to the
     // navbar, which is acceptable per the product rule (visibility on recovery).
-    if (!session.conversationId && this.loadConversationRef) {
+    if (this.engine !== "word" && !session.conversationId && this.loadConversationRef) {
       try {
         const ref = await this.loadConversationRef(); dlog(`[cdp-web] loadConversationRef for ${sid} returned id=${ref?.id ?? "(null)"}`)
         if (ref?.id) {
@@ -833,6 +991,9 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       await writeTargetClaim(session.targetId, sid, session.temporary).catch((e) =>
         dlog("[cdp-web] writeTargetClaim failed:", (e as Error).message),
       )
+      // Word: remember sid → targetId so a resumed session re-adopts this exact
+      // tab (and, next time, resumes in place instead of starting a new chat).
+      if (this.engine === "word") await saveTabAffinity(sid, session.targetId)
     }
 
     this.sessions.set(sid, { session, fingerprint })
@@ -858,21 +1019,53 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
    * asked for: "is there a tab that ISN'T on anyone's claimed list?"
    */
   private async findUsableTab(port: number, sid?: string, ownConversationId?: string | null) {
-    const tabs = await findCopilotTabs(port)
+    // Engine-aware tab discovery: the word engine adopts Word Online parking-doc
+    // tabs (sharepoint.com / officeapps.live.com / word.cloud.microsoft / .docx),
+    // which the Copilot-chat filter would never match. Word tabs carry no
+    // /chat/conversation/<guid> URL, so the GUID guards below simply no-op for
+    // them (tabGuid returns null) and dedupe falls back to the targetId claims.
+    const tabs = this.engine === "word" ? await findWordTabs(port) : await findCopilotTabs(port)
     const claimedGuidSet = await claimedGuids(sid)
     const claimedTargetSet = await claimedTargetIds(sid)
+
+    // Diagnostics: log every candidate the engine filter surfaced. When Word
+    // spawns a new tab instead of adopting the one you already have open, this
+    // line shows exactly what /json/list returned and why each was skipped.
+    dlog(
+      `[cdp-web] findUsableTab(${this.engine}): ${tabs.length} candidate(s): ` +
+        tabs.map((t) => `${t.id.slice(0, 8)}[${t.type}]${(t.url || "").slice(0, 60)}`).join(" | "),
+    )
+
+    // Word affinity: prefer the EXACT tab this sid last drove. CDP targetIds are
+    // stable for the browser's lifetime, so a resumed session re-adopts its own
+    // tab even after an opencode restart — and when several Word tabs are open,
+    // each sid routes back to its own instead of grabbing the first free one.
+    if (this.engine === "word" && sid) {
+      const aff = await loadTabAffinity(sid)
+      if (aff) {
+        const match = tabs.find((t) => t.id === aff.targetId && !!t.webSocketDebuggerUrl)
+        const usable = match && !isTargetClaimed(match.id) && !claimedTargetSet.has(match.id)
+        dlog(`[cdp-web word] affinity for sid=${sid}: targetId=${aff.targetId.slice(0, 8)} present=${!!match} usable=${!!usable}`)
+        if (usable) return match!
+        // Stale record (old tab closed) → fall through to the first free Word tab.
+        // That's the manual-recovery case: the user opened a fresh tab and
+        // navigated to the conversation; we adopt it and (resumeInPlace) continue.
+      }
+    }
+
     for (const tab of tabs) {
       // In-process guard (this process's own sessions).
-      if (isTargetClaimed(tab.id)) continue
+      if (isTargetClaimed(tab.id)) { dlog(`[cdp-web] skip ${tab.id.slice(0, 8)}: claimed in-process`); continue }
       // Cross-process tab-id guard: another live opencode process is driving
       // this exact tab (works for temp tabs that have no conversation GUID).
-      if (claimedTargetSet.has(tab.id)) continue
+      if (claimedTargetSet.has(tab.id)) { dlog(`[cdp-web] skip ${tab.id.slice(0, 8)}: claimed by other process`); continue }
       const guid = this.tabGuid(tab.url)
       // Cross-process GUID guard: another live process owns this conversation.
       // Blank tab (no guid) => stealable. Our own guid => fine to reuse.
-      if (guid && claimedGuidSet.has(guid) && guid !== ownConversationId) continue
+      if (guid && claimedGuidSet.has(guid) && guid !== ownConversationId) { dlog(`[cdp-web] skip ${tab.id.slice(0, 8)}: guid owned by other`); continue }
       return tab
     }
+    dlog(`[cdp-web] findUsableTab(${this.engine}): no usable tab among ${tabs.length} candidate(s)`)
     return null
   }
 
@@ -882,6 +1075,83 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
   private async findAnyPageTab(port: number) {
     const targets = await listTargets(port)
     return targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl) || null
+  }
+
+  /**
+   * Word engine bootstrap: wait for the Word editor shell, open the "Chat with
+   * Copilot" pane, resolve the Copilot OOPIF, and route this session's client
+   * into that frame (defaultSessionId). Auth for Word is implicit: if the frame
+   * (which holds the composer) resolves, the tab is signed in; if it never
+   * resolves we surface a Word-specific reauth error asking the user to sign
+   * into the Word tab. Replaces waitForAuth for the word engine.
+   */
+  private async ensureWordFrame(session: SessionState): Promise<void> {
+    const client = session.client
+    if (!client) throw new CDPError("Session has no connected client")
+
+    // Fast path: if we already have a routed Copilot frame and the composer is
+    // still present there, keep using it. This avoids re-opening/re-probing the
+    // pane on every recovery check while still detecting stale detached frames.
+    if (
+      session.frameSessionId &&
+      client.sessions.has(session.frameSessionId)
+    ) {
+      try {
+        client.defaultSessionId = session.frameSessionId
+        if (await checkComposer(client)) {
+          session.authenticated = true
+          return
+        }
+      } catch {
+        // Stale frame; fall through to full re-resolution.
+      }
+    }
+
+    session.frameSessionId = null
+    client.defaultSessionId = undefined
+
+    dlog("[cdp-web word] waiting for Word editor frame ('Chat with Copilot' entry point)…")
+    const shellSid = await waitForWordShell(client, 60_000)
+    if (!shellSid) {
+      dlog("[cdp-web word] Word editor frame / 'Chat with Copilot' entry point not found (see attached-frames dump above)")
+      const loginFramePresent = [...client.sessions.values()].some((info: any) => {
+        const url = String(info?.url || '').toLowerCase()
+        return url.includes('login.microsoftonline.com') || url.includes('login.live.com')
+      })
+      session.authenticated = false
+      if (loginFramePresent) {
+        throw new CopilotReauthRequired()
+      }
+      throw new CDPError('Word editor shell not available. The document may still be loading or the Word frame topology may have changed.')
+    }
+    dlog(`[cdp-web word] Word editor frame ready (session ${shellSid}) — opening Copilot pane + resolving composer frame…`)
+    const frameSid = await resolveCopilotFrame(client, shellSid, 30_000)
+    if (!frameSid) {
+      dlog("[cdp-web word] Copilot OOPIF did not resolve (pane failed to mount or auth required)")
+      const loginFramePresent = [...client.sessions.values()].some((info: any) => {
+        const url = String(info?.url || '').toLowerCase()
+        return url.includes('login.microsoftonline.com') || url.includes('login.live.com')
+      })
+      session.authenticated = false
+      if (loginFramePresent) {
+        throw new CopilotReauthRequired()
+      }
+      throw new CDPError('Word Copilot frame could not be resolved. The pane may not have mounted or the frame topology may have changed.')
+    }
+
+    // Route every subsequent driver call into the Copilot frame. The top-target
+    // driver-dom functions (checkComposer, sendPrompt, awaitResponse, …) then
+    // operate on the OOPIF unchanged.
+    session.frameSessionId = frameSid
+    client.defaultSessionId = frameSid
+    session.authenticated = true
+    dlog(`[cdp-web word] Copilot frame ready (session ${frameSid}) — client routed into frame`)
+
+    // Neutralize Word's document-assistant persona: the surface pins a
+    // `WordDraftingAgent` gpt in the outgoing invocation envelope, which makes
+    // Opus refuse agentic/coding work. Patch WebSocket.send inside the frame to
+    // rewrite it to the neutral general-chat agent before the first prompt.
+    await installEnvelopeRewrite(client, frameSid)
   }
 
   /**
@@ -1134,9 +1404,13 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     session.targetId = null
     session.initialized = false // force re-init (reopen conversation) after swap
 
-    let tab = await this.findUsableTab(port, sid, session.conversationId ?? undefined)
+    let tab = await this.findUsableTab(
+      port,
+      sid,
+      this.engine === "word" ? undefined : (session.conversationId ?? undefined),
+    )
     if (!tab) {
-      const created = await createTabViaCDP(port, "https://m365.cloud.microsoft/chat")
+      const created = await createTabViaCDP(port, this.engineTargetUrl())
       tab = created ?? (await openCopilotTab(port))
     }
     if (!tab || !tab.webSocketDebuggerUrl) {
@@ -1277,7 +1551,13 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       // after a browser relaunch/swap the page can be COLD (still loading, cookies
       // not applied yet); a single failed read here would wrongly re-enter the
       // auth gate and cause the swap cascade. A short retry absorbs that.
-      let authed = await checkAuth(client)
+      let authed = this.engine === "word"
+        ? !!(
+            session.frameSessionId &&
+            client.sessions.has(session.frameSessionId) &&
+            (await checkComposer(client).catch(() => false))
+          )
+        : await checkAuth(client)
 
       // ─── MID-SESSION REAUTH POPUP GATE ─────────────────────────────────────
       // Copilot can invalidate the session WITHOUT a URL redirect: it leaves the
@@ -1290,7 +1570,10 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       // until the user is signed back in and then resumes THIS turn. Note: an
       // embedded login iframe alone is NOT treated as reauth (routine silent SSO
       // uses it) — only the decisive popup blocks the send.
-      const reauth = await checkReauth(client)
+      // m365 only: the mid-session reauth alertdialog is a top-page overlay on
+      // the flat chat surface. The word engine's auth lives inside the Copilot
+      // OOPIF and is (re)established by ensureWordFrame, so skip this gate.
+      const reauth = this.engine === "word" ? { reauth: false, hasContinue: false, loginFrame: false } : await checkReauth(client)
       if (reauth.reauth) {
         dlog(`[cdp-web] pre-send: mid-session reauth popup detected (continue=${reauth.hasContinue}, loginFrame=${reauth.loginFrame}) — clicking Continue, entering auth gate`)
         if (reauth.hasContinue) {
@@ -1317,23 +1600,58 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       }
       if (!authed) {
         dlog("[cdp-web] pre-send auth check failed after retries — entering auth gate")
-        await this.waitForAuth(session)
-        // waitForAuth may have swapped the client (headed handoff). Re-read it.
+        if (this.engine === "word") {
+          // Word: the composer lives in the OOPIF. A failed check has two causes:
+          //  (a) the pane was closed / re-navigated but the TAB is still alive →
+          //      re-resolve the frame on the same client (ensureWordFrame).
+          //  (b) the user CLOSED the tab we were driving → the client is dead and
+          //      ensureWordFrame would poll a corpse until timeout (observed:
+          //      "attached frames (0)" for 60s). Re-BIND instead, which re-runs
+          //      findUsableTab and adopts whatever Word tab is now open (e.g. the
+          //      new tab the user opened to resume the conversation).
+          const tabAlive =
+            client.isConnected() &&
+            !!session.targetId &&
+            (await listTargets(this.enginePort()).catch(() => [])).some((t) => t.id === session.targetId)
+          if (!tabAlive) {
+            dlog(`[cdp-web word] auth gate: bound tab gone (connected=${client.isConnected()}, targetId=${session.targetId ?? "(none)"}) — re-binding to a usable Word tab`)
+            this.sessions.delete(sid)
+            session = await this.ensureBoundSession(sid, fingerprint)
+            session.initialized = false
+          } else {
+            await this.ensureWordFrame(session)
+          }
+        } else {
+          await this.waitForAuth(session)
+        }
+        // waitForAuth/ensureWordFrame may have swapped the client (headed handoff)
+        // or re-routed into a fresh frame. Re-read it.
         client = session.client
         if (!client) throw new CDPError("Session has no connected client after reauth")
       }
 
-      // Per-turn drift guard: for an established session, verify the tab still
-      // shows OUR conversation. If it was stolen, idle-reset to /chat, or
-      // navigated elsewhere, force re-init so the reopen block below re-navigates
-      // to our GUID (opening/acquiring a fresh tab if ours is gone). Prevents
-      // sending this turn into another session's conversation.
-      // Part A: runs for BOTH modes now — temp has a GUID to compare against.
-      if (!isInitial && session.initialized && session.conversationId) {
+      // Per-turn drift guard.
+      // m365: conversation GUID ownership.
+      // word: tab affinity ownership (targetId + frame liveness).
+      if (this.engine === "word") {
+        const claimedByOther = session.targetId ? (await claimedTargetIds(sid)).has(session.targetId) : false
+        const frameAlive = !!(
+          session.frameSessionId &&
+          client.sessions.has(session.frameSessionId)
+        )
+        if (claimedByOther || !frameAlive) {
+          dlog(`[cdp-web word] drift: targetId=${session.targetId ?? "(none)"} claimedByOther=${claimedByOther} frameAlive=${frameAlive} - re-acquiring bound tab`)
+          this.sessions.delete(sid)
+          session = await this.ensureBoundSession(sid, fingerprint)
+          session.initialized = false
+          client = session.client
+          if (!client) throw new CDPError("Session has no connected client after drift re-acquire")
+        }
+      } else if (!isInitial && session.initialized && session.conversationId) {
         const live = await getConversationInfo(client).catch(() => ({ id: null, title: null, url: "" }))
         const claimedByOther = session.targetId ? (await claimedTargetIds(sid)).has(session.targetId) : false
         if (live.id !== session.conversationId || claimedByOther) {
-          dlog(`[cdp-web] drift: tab on ${live.id ?? "(none)"} but we own ${session.conversationId} (claimedByOther=${claimedByOther}) — re-acquiring our own tab`)
+          dlog(`[cdp-web] drift: tab on ${live.id ?? "(none)"} but we own ${session.conversationId} (claimedByOther=${claimedByOther}) - re-acquiring our own tab`)
           this.sessions.delete(sid)
           session = await this.ensureBoundSession(sid, fingerprint)
           session.initialized = false
@@ -1344,6 +1662,53 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
 
       // Initialize conversation if needed
       if (isInitial || !session.initialized) {
+        if (this.engine === "word") {
+          // Word: no temporary toggle, no model switcher (Phase 4), and no GUID
+          // reopen. If the composer vanished (frame lost / pane closed), re-resolve
+          // the frame first.
+          if (!(await checkComposer(client))) {
+            await this.ensureWordFrame(session)
+            client = session.client
+            if (!client) throw new CDPError("Session has no connected client after word frame re-resolve")
+          }
+          // Temporary word model (id carries "-temp"): always start a fresh
+          // TEMPORARY chat so agentic runs never clutter the user's Copilot
+          // history. Temp chats are ephemeral by design, so they don't resume in
+          // place — this takes precedence over resumeInPlace.
+          if (this.temporary) {
+            dlog("[cdp-web word] initializing: new TEMPORARY chat in Copilot pane")
+            await wordOpenTempChat(client)
+          } else if (session.resumeInPlace) {
+            // New chat ONLY for a brand-new sid. A resumed sid (tab still alive,
+            // or manual recovery: user reopened a tab + navigated to the
+            // conversation) must CONTINUE the pane's current conversation in
+            // place — clicking New Chat here would wipe exactly what the user
+            // came back to. resumeInPlace is set at bind time from the sid's
+            // tab-affinity record.
+            //
+            // The pane already holds the full preamble/tools/prior turns from the
+            // earlier session, so mark this as a resumed existing conversation:
+            // the resume-delta block below then sends ONLY the newest user turn
+            // instead of re-sending the whole initial payload (which would
+            // duplicate everything the chat already has).
+            resumedExisting = true
+            dlog("[cdp-web word] initializing: resuming existing conversation in place (no new chat, delta only)")
+          } else {
+            dlog("[cdp-web word] initializing: new chat in Copilot pane")
+            await wordOpenNewChat(client)
+          }
+          // wordOpenNewChat/wordOpenTempChat above can re-render the pane (a
+          // fresh chat is effectively a frame navigation), which resets the
+          // OOPIF's JS realm and silently drops the envelope-rewrite patch.
+          // Reinstall it here, right after the settle delay those functions
+          // already wait out, rather than leaving it to the generic per-send
+          // check below — checking immediately before sendPrompt on this same
+          // turn races a frame that just finished re-rendering.
+          if (session.frameSessionId) await installEnvelopeRewrite(client, session.frameSessionId)
+          session.initialized = true
+          session.turnCount = 0
+          dlog("[cdp-web word] init complete")
+        } else {
         dlog("[cdp-web] initializing: opening temp chat + setting effort")
         const hasComposer = await checkComposer(client)
         if (!hasComposer) {
@@ -1459,6 +1824,7 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
         session.initialized = true
         session.turnCount = 0
         dlog("[cdp-web] init complete")
+        }
       }
 
       // Resume with existing history: if we reopened a pre-existing conversation,
@@ -1535,6 +1901,22 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       // Strip attachment refs and file paths from the message
       messageToSend = stripAttachmentRefs(detectedPaths.length > 0 ? cleanedMessage : messageToSend)
 
+      // Word only: re-assert the full original framing (preamble + CURRENT tool
+      // manifest, pulled fresh from options so a mid-conversation tool-list
+      // change is never stale) every reminderTokenInterval cumulative tokens —
+      // see formatReminderMessage doc above. Skip turn 0 — formatInitialMessage
+      // already carries this — and skip compaction turns, which must stay a
+      // bare summarizer instruction.
+      if (this.engine === "word" && !isInitial && !isCompaction) {
+        const interval = this.config.reminderTokenInterval ?? 35_000
+        const tokensSoFar = session.cumulativeInputTokens + session.cumulativeOutputTokens
+        if (tokensSoFar - session.tokensAtLastReminder >= interval) {
+          dlog(`[cdp-web word] injecting full instructions reminder (tokensSoFar=${tokensSoFar}, sinceLast=${tokensSoFar - session.tokensAtLastReminder}, interval=${interval})`)
+          messageToSend = `${formatReminderMessage(options, isSubagent)}\n\n${messageToSend}`
+          session.tokensAtLastReminder = tokensSoFar
+        }
+      }
+
       // Count turns BEFORE sending (the response will be the next one)
       const turnsBefore = await getTurnCount(client)
       dlog(`[cdp-web] turnsBefore (pre-send): ${turnsBefore}, isInitial=${isInitial}`)
@@ -1548,6 +1930,23 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     const preferWs = !this.modelId.includes("-dom")
     const wsCapture = preferWs ? beginResponseCapture(client, options.abortSignal) : null
 
+    // Word only: the envelope rewrite lives on the OOPIF's WebSocket.prototype
+    // and only survives while the frame's JS realm is unchanged. An in-place
+    // reload of the frame (no CDP detach, so nothing else here notices) wipes
+    // it silently, letting Word's WordDraftingAgent persona back onto the wire.
+    // Cheap to check, so verify on every send rather than trusting staleness
+    // checks that can't see a realm reset. Skip on the first turn — the init
+    // block above already reinstalls it deterministically right after the
+    // new-chat navigation settles; checking again immediately here would race
+    // that same still-settling frame.
+    if (this.engine === "word" && session.frameSessionId && !isInitial) {
+      const patched = await client.evaluate("!!window.__cdpEnvRewrite", session.frameSessionId).catch(() => false)
+      if (!patched) {
+        dlog(`[cdp-web word] envelope rewrite missing before send (sid=${sid}), reinstalling`)
+        await installEnvelopeRewrite(client, session.frameSessionId)
+      }
+    }
+
     await sendPrompt(client, messageToSend)
     session.messagesSent = options.prompt.length
 
@@ -1557,7 +1956,10 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
     // Part A: runs for BOTH modes now — a temp chat has a real GUID too, and
     // capturing it (a passive read) is what makes temp "invisible but
     // recoverable." Capturing does NOT promote the chat; only a send does.
-    if (!session.conversationId) {
+    // m365 only: capture the /chat/conversation/<guid> recovery key. Word's
+    // Copilot pane carries no such GUID URL, so skip the 20s poll for word
+    // (conversation resume/persistence is Phase 4 for the word engine).
+    if (this.engine !== "word" && !session.conversationId) {
         const info = await waitForConversationId(client, 20000)
       if (info.id) {
         session.conversationId = info.id
@@ -1701,6 +2103,11 @@ export class CDPWebLanguageModel implements LanguageModelV3 {
       if (hasToolCalls) {
         dlog(`[cdp-web] parsed ${emittedCalls.length} tool call(s): ${emittedCalls.map((c) => `${c.name}(${c.id})`).join(", ")}`)
         for (const call of emittedCalls) {
+          // NOTE: entity DECODE happens upstream in driver-ws.ts (decodeHtmlEntities,
+          // at the WS source before JSON parsing), so call.input already holds real
+          // characters here. The outbound entity-ESCAPE is in formatDeltaMessages; the
+          // two form the round trip that survives Copilot's HTML sanitizer. See
+          // html-escape.ts.
           dlog(`[cdp-web]   call ${call.name}: input=${call.input.slice(0, 200)}`)
           content.push({
             type: "tool-call",

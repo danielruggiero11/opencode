@@ -14,7 +14,8 @@
     "profile:test": "bun run script/profile-test-files.ts",
     "build": "bun run script/build.ts",
     "dev": "bun run --conditions=browser ./src/index.ts",
-    "dev:temporary": "bun run --conditions=browser ./src/temporary.ts"
+    "dev:temporary": "bun run --conditions=browser ./src/temporary.ts",
+    "dev:sidecar": "bun run --conditions=browser ./src/provider/cdp-web/sidecar.ts"
   },
   "bin": {
     "opencode": "./bin/opencode"

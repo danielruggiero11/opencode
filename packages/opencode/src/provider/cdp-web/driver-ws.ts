@@ -82,9 +82,31 @@ const clientState = new WeakMap<CDPClient, WsListenerState>()
 /**
  * Enable Network domain and register WebSocket event listeners.
  * Call once per CDPClient after connecting.
+ *
+ * `allSessions` (word engine): the Chathub SignalR socket lives inside the
+ * Copilot OOPIF, not the top page, so Network must be enabled on every attached
+ * session — not just the top target — for its frames to be observed. We enable
+ * Network on each currently-attached session and, via Target.attachedToTarget,
+ * on any frame/worker that attaches later. The frame handler dispatch below is
+ * already session-agnostic (CDP events fan out to all listeners regardless of
+ * sessionId), so beginResponseCapture is reused unchanged. The "" sentinel is
+ * NOT used here — we address each session explicitly by its sessionId.
  */
-export async function enableWsCapture(client: CDPClient): Promise<void> {
+export async function enableWsCapture(client: CDPClient, opts?: { allSessions?: boolean }): Promise<void> {
   await client.send("Network.enable", {})
+
+  if (opts?.allSessions) {
+    // Enable Network on every already-attached OOPIF/worker session.
+    for (const sid of client.sessions.keys()) {
+      await client.send("Network.enable", {}, sid).catch(() => {})
+    }
+    // …and on any session that attaches after this point (the Copilot frame or
+    // its Chathub worker can attach late, after the pane mounts).
+    client.on("Target.attachedToTarget", (params: { sessionId?: string }) => {
+      const sid = params?.sessionId
+      if (sid) client.send("Network.enable", {}, sid).catch(() => {})
+    })
+  }
 
   const state: WsListenerState = {
     chathubRequestIds: new Set(),
@@ -112,10 +134,13 @@ export async function enableWsCapture(client: CDPClient): Promise<void> {
   // Also capture WebSocket frames sent BY the page (outgoing). Copilot sends
   // invocation requests via WS; monitoring these helps us correlate responses.
   client.on("Network.webSocketFrameSent", (params: { requestId: string; response: { payloadData: string } }) => {
-    // If this requestId sends to a Chathub URL, track it
-    // (handles case where WS was created before Network.enable)
     if (!state.chathubRequestIds.has(params.requestId)) return
-    // Could log outgoing for debug if needed
+    // Diagnostic ONLY (env-gated): dump the outgoing invocation ENVELOPE so we
+    // can diff what the Word surface stamps onto a turn vs. the general chat
+    // surface (source app, mode, plugins, grounding hints). Large string blobs
+    // (our prompt/context) are collapsed to <str len=N> so the metadata fields
+    // stay readable. Off by default — set CDP_WS_DUMP_SENT=1 to enable.
+    if (process.env["CDP_WS_DUMP_SENT"]) dumpOutgoingEnvelope(params.response.payloadData)
   })
 }
 
@@ -283,6 +308,25 @@ export function awaitResponseWs(client: CDPClient, signal?: AbortSignal): Promis
  */
 function decodeHtmlEntities(text: string): string {
   if (!text) return text
+  // Copilot DOUBLE-escapes: we entity-escape file content on the way out (html-escape.ts
+  // escapeHtmlPayload), then Copilot's own input pipeline escapes the ampersands AGAIN,
+  // so the model sees (and, per the preamble rule, faithfully reproduces) `&amp;lt;` where
+  // the file has `<`. A single decode pass strips only one level, leaving `&lt;` — which
+  // no longer matches the file and the edit fails. Decode to a FIXED POINT so any residual
+  // escape depth collapses back to the real character. Bounded to avoid pathological loops.
+  let out = text
+  for (let i = 0; i < 5; i++) {
+    const next = decodeHtmlEntitiesOnce(out)
+    if (next === out) break
+    out = next
+  }
+  return out
+}
+
+/** One pass of entity decoding. Ampersand LAST so a double-encoded entity collapses by
+ *  exactly one level per pass (the fixed-point loop in decodeHtmlEntities repeats it). */
+function decodeHtmlEntitiesOnce(text: string): string {
+  if (!text) return text
   const AMP = String.fromCharCode(38)
   const LT = String.fromCharCode(60)
   const GT = String.fromCharCode(62)
@@ -310,6 +354,44 @@ function decodeHtmlEntities(text: string): string {
   // Ampersand LAST.
   out = out.split(AMP + "amp;").join(AMP)
   return out
+}
+
+/**
+ * DIAGNOSTIC (env-gated via CDP_WS_DUMP_SENT): log the ENVELOPE of an outgoing
+ * SignalR invocation so the Word surface's turn metadata can be diffed against
+ * the general-chat surface. Any string longer than 200 chars (our prompt, the
+ * serialized context/history) is collapsed to `<str len=N>` so the interesting
+ * host-context fields — source, mode, plugins, grounding/options — stay legible.
+ * Purely observational; never alters what is sent.
+ */
+function redactBlobs(v: unknown): unknown {
+  if (typeof v === "string") return v.length > 200 ? `<str len=${v.length}>` : v
+  if (Array.isArray(v)) return v.map(redactBlobs)
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {}
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = redactBlobs(val)
+    return out
+  }
+  return v
+}
+
+function dumpOutgoingEnvelope(payload: string): void {
+  const parts = payload.split("\x1e").filter(Boolean)
+  for (const part of parts) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(part)
+    } catch {
+      continue
+    }
+    // Skip keepalives (type 6) — no envelope of interest.
+    if ((parsed as { type?: number })?.type === 6) continue
+    try {
+      dlog(`[cdp-web ws SENT] ${JSON.stringify(redactBlobs(parsed), null, 2)}`)
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 /**

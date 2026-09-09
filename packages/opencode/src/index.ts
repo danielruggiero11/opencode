@@ -15,6 +15,7 @@ import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FormatError } from "./cli/error"
 import { ServeCommand } from "./cli/cmd/serve"
+import { SidecarCommand } from "./cli/cmd/sidecar"
 import { DebugCommand } from "./cli/cmd/debug"
 import { StatsCommand } from "./cli/cmd/stats"
 import { McpCommand } from "./cli/cmd/mcp"
@@ -125,6 +126,7 @@ const cli = yargs(args)
   .command(UpgradeCommand)
   .command(UninstallCommand)
   .command(ServeCommand)
+  .command(SidecarCommand)
   .command(WebCommand)
   .command(ModelsCommand)
   .command(StatsCommand)

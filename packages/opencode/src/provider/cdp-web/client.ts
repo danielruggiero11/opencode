@@ -20,6 +20,30 @@ export class CDPClient {
   private connected = false
   private listeners = new Map<string, Set<(params: any) => void>>()
 
+  /**
+   * OOPIF support (opt-in, word engine only). When auto-attach is enabled at
+   * connect() time, every nested cross-origin iframe/worker target that attaches
+   * to this socket is tracked here, keyed by its CDP sessionId -> targetInfo.
+   * Commands can then be routed into a specific frame by passing its sessionId
+   * to send()/evaluate(). For the web engine this map stays empty and unused, so
+   * that path is byte-identical to before.
+   */
+  readonly sessions = new Map<string, any>()
+  private autoAttach = false
+
+  /**
+   * OOPIF routing default (word engine only). When set to a frame's CDP
+   * sessionId, every session-aware helper (evaluate/insertText/pressKey/
+   * clickXY/clickSelector/setFileInput) and send() itself transparently address
+   * that frame unless an explicit sessionId is passed. This lets the existing
+   * top-target driver functions (checkComposer, sendPrompt, awaitResponse, …)
+   * drive the Copilot OOPIF unchanged once the frame is resolved. Pass the
+   * sentinel "" as an explicit sessionId to force the TOP target even while this
+   * is set (used for browser-level commands like Browser.grantPermissions). Left
+   * undefined for the m365 engine, so that path is byte-identical to before.
+   */
+  defaultSessionId?: string
+
   constructor(private readonly wsUrl: string) {}
 
   /** Subscribe to a CDP event (e.g. "Network.webSocketFrameReceived"). */
@@ -33,7 +57,7 @@ export class CDPClient {
     this.listeners.get(event)?.delete(handler)
   }
 
-  async connect(): Promise<void> {
+  async connect(options?: { autoAttach?: boolean }): Promise<void> {
     if (this.connected) return
     this.ws = new WebSocket(this.wsUrl)
     await new Promise<void>((resolve, reject) => {
@@ -72,6 +96,104 @@ export class CDPClient {
         p.reject(new CDPError("WebSocket closed"))
       }
       this.pending.clear()
+      this.sessions.clear()
+    }
+
+    // OOPIF support (opt-in). Word Online embeds the editor + Copilot pane in
+    // nested cross-origin out-of-process iframes that do NOT surface as
+    // execution contexts on the top page's socket. Flattened auto-attach pulls a
+    // session for every nested frame/worker onto THIS one socket; we then route
+    // Runtime.evaluate / Input.* into a frame via its sessionId. Guarded so the
+    // web engine (which never passes autoAttach) is completely unaffected.
+    if (options?.autoAttach) {
+      await this.enableAutoAttach()
+    }
+  }
+
+  /**
+   * Turn on flattened, recursive Target auto-attach for this connection so that
+   * nested OOPIFs (e.g. the Word editor frame and the Copilot app frame inside
+   * it) attach onto this single socket. Each newly-attached target is tracked in
+   * `sessions` and has auto-attach re-enabled on it, so attachment recurses all
+   * the way down. Idempotent. Only used by the word engine.
+   */
+  async enableAutoAttach(): Promise<void> {
+    if (this.autoAttach) return
+    this.autoAttach = true
+
+    // Track sessions as targets attach/detach, and recurse into each new target
+    // so its own children also flatten onto this socket. The recursive
+    // setAutoAttach is fire-and-forget (a detached/short-lived target may reject).
+    this.on("Target.attachedToTarget", (params: any) => {
+      const sid = params?.sessionId
+      if (!sid) return
+      this.sessions.set(sid, params.targetInfo)
+      this.send(
+        "Target.setAutoAttach",
+        { autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+        sid,
+      ).catch(() => {})
+    })
+    this.on("Target.detachedFromTarget", (params: any) => {
+      const sid = params?.sessionId
+      if (!sid) return
+      this.sessions.delete(sid)
+      // Word engine stale-frame recovery: if the currently-routed Copilot OOPIF
+      // detaches (pane closed, frame re-render, navigation), immediately drop the
+      // routing target so the next probe does not keep sending Runtime/Input
+      // commands into a dead sessionId.
+      if (this.defaultSessionId === sid) {
+        this.defaultSessionId = undefined
+      }
+    })
+
+    // Kick off attachment from the top target. Child attachedToTarget events
+    // arrive asynchronously; callers should give them a beat (or use
+    // waitForFrameSession) before enumerating `sessions`.
+    await this.send("Target.setAutoAttach", {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+    })
+  }
+
+  /**
+   * Find the attached OOPIF whose document satisfies `testExpression` (a JS
+   * expression evaluated inside each candidate frame that returns truthy on a
+   * match). Used to locate the Copilot composer frame, e.g.
+   *   `!!document.querySelector('#m365-chat-editor-target-element')`
+   * Enables Runtime per candidate session (attached frames start without it) and
+   * returns the first matching sessionId, or null. Only iframe/page/webview
+   * targets are probed; workers and other target types are skipped.
+   */
+  async findFrameSession(testExpression: string): Promise<string | null> {
+    for (const [sid, info] of this.sessions) {
+      const type = info?.type
+      if (type !== "iframe" && type !== "page" && type !== "webview") continue
+      try {
+        await this.send("Runtime.enable", undefined, sid)
+        const matched = await this.evaluate(testExpression, sid)
+        if (matched) return sid
+      } catch {
+        // Frame may have navigated/detached mid-probe; skip it.
+        continue
+      }
+    }
+    return null
+  }
+
+  /**
+   * Wait up to `timeoutMs` for `findFrameSession(testExpression)` to resolve a
+   * matching OOPIF, polling as child targets attach asynchronously after
+   * auto-attach is enabled. Returns the sessionId or null on timeout.
+   */
+  async waitForFrameSession(testExpression: string, timeoutMs = 8000): Promise<string | null> {
+    const deadline = Date.now() + timeoutMs
+    for (;;) {
+      const sid = await this.findFrameSession(testExpression)
+      if (sid) return sid
+      if (Date.now() >= deadline) return null
+      await new Promise((r) => setTimeout(r, 250))
     }
   }
 
@@ -87,10 +209,16 @@ export class CDPClient {
     return this.connected
   }
 
-  async send(method: string, params?: Record<string, unknown>): Promise<any> {
+  async send(method: string, params?: Record<string, unknown>, sessionId?: string): Promise<any> {
     if (!this.ws || !this.connected) throw new CDPError("Not connected")
     const id = this.nextId++
-    const msg = JSON.stringify({ id, method, params })
+    const envelope: Record<string, unknown> = { id, method, params }
+    // Route into the OOPIF frame by default (word engine) unless the caller
+    // passed an explicit sessionId. The sentinel "" forces the TOP target even
+    // when a frame default is set (browser-level commands).
+    const sid = sessionId === "" ? undefined : (sessionId ?? this.defaultSessionId)
+    if (sid) envelope.sessionId = sid
+    const msg = JSON.stringify(envelope)
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
       try {
@@ -102,54 +230,56 @@ export class CDPClient {
     })
   }
 
-  async evaluate(expression: string): Promise<any> {
+  async evaluate(expression: string, sessionId?: string): Promise<any> {
     const result = await this.send("Runtime.evaluate", {
       expression,
       returnByValue: true,
       awaitPromise: false,
-    })
+    }, sessionId)
     if (result?.exceptionDetails) {
       throw new CDPError(`JS exception: ${result.exceptionDetails.text}`)
     }
     return result?.result?.value
   }
 
-  async evaluateAsync(expression: string): Promise<any> {
+  async evaluateAsync(expression: string, sessionId?: string): Promise<any> {
     const result = await this.send("Runtime.evaluate", {
       expression,
       returnByValue: true,
       awaitPromise: true,
-    })
+    }, sessionId)
     if (result?.exceptionDetails) {
       throw new CDPError(`JS exception: ${result.exceptionDetails.text}`)
     }
     return result?.result?.value
   }
 
-  async insertText(text: string): Promise<void> {
-    await this.send("Input.insertText", { text })
+  async insertText(text: string, sessionId?: string): Promise<void> {
+    await this.send("Input.insertText", { text }, sessionId)
   }
 
-  async pressKey(key: string, code: string, keyCode: number): Promise<void> {
+  async pressKey(key: string, code: string, keyCode: number, sessionId?: string): Promise<void> {
     await this.send("Input.dispatchKeyEvent", {
       type: "keyDown",
       key,
       code,
       windowsVirtualKeyCode: keyCode,
-    })
+    }, sessionId)
     await this.send("Input.dispatchKeyEvent", {
       type: "keyUp",
       key,
       code,
       windowsVirtualKeyCode: keyCode,
-    })
+    }, sessionId)
   }
 
   async grantClipboard(origin: string): Promise<void> {
+    // Browser-level command — force the TOP/browser target ("" sentinel) so a
+    // frame default (word engine) never routes it into an OOPIF, which rejects it.
     await this.send("Browser.grantPermissions", {
       permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"],
       origin,
-    })
+    }, "")
   }
 
   /**
@@ -157,7 +287,7 @@ export class CDPClient {
    * Fluent UI menus require Input.dispatchMouseEvent — synthetic .click() is ignored.
    * Returns true if the element was found and clicked.
    */
-  async clickSelector(selector: string): Promise<boolean> {
+  async clickSelector(selector: string, sessionId?: string): Promise<boolean> {
     const rect = await this.evaluate(`
       (() => {
         const el = document.querySelector(${JSON.stringify(selector)});
@@ -165,7 +295,7 @@ export class CDPClient {
         const r = el.getBoundingClientRect();
         return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
       })()
-    `)
+    `, sessionId)
     if (!rect) return false
     await this.clickXY(rect.x, rect.y)
     return true
@@ -235,6 +365,28 @@ export async function findCopilotTabs(port: number): Promise<CDPTarget[]> {
       urlLower.includes("microsoft365.com/chat") ||
       urlLower.includes("m365.cloud.microsoft/chat") ||
       urlLower.includes("copilot.microsoft.com")
+    )
+  })
+}
+
+/**
+ * Find all Word Online tabs (parking docs for the word engine). Word routes
+ * Copilot through its own token allocation, so we drive the BizChat pane
+ * embedded in a Word Online tab rather than the general chat surface. Matches
+ * the same host set the Python prototype's `_looks_like_word` used.
+ */
+export async function findWordTabs(port: number): Promise<CDPTarget[]> {
+  const targets = await listTargets(port)
+  return targets.filter((t) => {
+    if (t.type !== "page" || !t.webSocketDebuggerUrl) return false
+    const urlLower = (t.url || "").toLowerCase()
+    const titleLower = (t.title || "").toLowerCase()
+    return (
+      urlLower.includes("word.cloud.microsoft") ||
+      urlLower.includes("officeapps.live.com") ||
+      urlLower.includes("sharepoint.com") ||
+      urlLower.includes(".docx") ||
+      titleLower.includes(".docx")
     )
   })
 }

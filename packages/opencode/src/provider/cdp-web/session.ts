@@ -20,14 +20,36 @@ export interface SessionState {
   client: CDPClient | null
   /** The CDP target ID for this tab */
   targetId: string | null
+  /**
+   * Word engine only: the CDP sessionId of the resolved Copilot OOPIF (the
+   * out-of-process iframe whose document holds the BizChat composer). Set once
+   * the pane is opened and the frame is found; used as the client's
+   * defaultSessionId so the top-target driver functions drive the frame. Null
+   * for the m365 engine (flat page, no OOPIF).
+   */
+  frameSessionId: string | null
   /** Whether the conversation has been initialized (new chat opened, effort set) */
   initialized: boolean
+  /**
+   * Word engine only. True when this sid was bound to a Word tab before (a tab
+   * affinity record existed at bind time), so this turn is a RESUME: word init
+   * must continue the pane's current conversation in place instead of clicking
+   * New Chat and wiping it. False for a brand-new sid (clean chat wanted).
+   */
+  resumeInPlace: boolean
   /** Number of assistant turns completed in this conversation */
   turnCount: number
   /** Cumulative input tokens sent to Copilot across all turns (estimate) */
   cumulativeInputTokens: number
   /** Cumulative output tokens received from Copilot across all turns (estimate) */
   cumulativeOutputTokens: number
+  /**
+   * Word engine only. cumulativeInputTokens+cumulativeOutputTokens total at the
+   * last time the coding-agent reminder was injected into a delta message (0 =
+   * never sent one yet this conversation). Used to fire the reminder every
+   * `reminderTokenInterval` tokens rather than on a fixed turn count.
+   */
+  tokensAtLastReminder: number
   /** Whether this session is currently in use */
   busy: boolean
   /** Whether auth is valid for this tab */
@@ -65,10 +87,13 @@ export function createSession(fingerprint: string, temporary = true): SessionSta
     messagesSent: 0,
     client: null,
     targetId: null,
+    frameSessionId: null,
     initialized: false,
+    resumeInPlace: false,
     turnCount: 0,
     cumulativeInputTokens: 0,
     cumulativeOutputTokens: 0,
+    tokensAtLastReminder: 0,
     busy: false,
     authenticated: true,
     temporary,
@@ -179,11 +204,13 @@ export function getPoolStats(): { total: number; busy: number; free: number; una
 /**
  * Connect a session's CDP client to a specific tab's WebSocket URL.
  */
-export async function connectSession(session: SessionState, wsUrl: string): Promise<CDPClient> {
+export async function connectSession(session: SessionState, wsUrl: string, opts?: { autoAttach?: boolean }): Promise<CDPClient> {
   if (session.client?.isConnected()) return session.client
 
   const client = new CDPClient(wsUrl)
-  await client.connect()
+  // The word engine opts into flattened OOPIF auto-attach so the nested Copilot
+  // iframe attaches onto this socket; m365 never passes autoAttach (byte-identical).
+  await client.connect({ autoAttach: opts?.autoAttach })
   await client.send("Runtime.enable")
   await client.send("DOM.enable")
   await client.send("Page.enable")

@@ -31,6 +31,17 @@ export {
 export { enableWsCapture, awaitResponseWs, beginResponseCapture } from "./driver-ws"
 
 export {
+  waitForWordShell,
+  openCopilotPane,
+  resolveCopilotFrame,
+  installEnvelopeRewrite,
+  wordOpenNewChat,
+  wordOpenTempChat,
+  COPILOT_FRAME_PROBE,
+  COPILOT_COMPOSER_ID,
+} from "./driver-word"
+
+export {
   getConversationInfo,
   waitForConversationId,
   openConversationById,
