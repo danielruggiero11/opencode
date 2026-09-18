@@ -328,9 +328,11 @@ export async function setEffort(client: CDPClient, effort: string): Promise<void
     return
   }
 
-  // Wait for the mode switcher to appear (may take a moment after openNewChat)
+  // Wait for the mode switcher to appear (may take a moment after openNewChat).
+  // Increased from 5 to 10 retries (8s total) to handle slow page loads after
+  // SPA navigation that can cause the switcher to not be visible yet.
   let switcherVisible = false
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 10; attempt++) {
     switcherVisible = await client.evaluate(`
       (() => {
         const sw = document.getElementById('gptModeSwitcher');
@@ -338,7 +340,7 @@ export async function setEffort(client: CDPClient, effort: string): Promise<void
       })()
     `) as boolean
     if (switcherVisible) break
-    dlog(`[cdp-web setEffort] switcher not visible yet (attempt ${attempt + 1}/5)`)
+    dlog(`[cdp-web setEffort] switcher not visible yet (attempt ${attempt + 1}/10)`)
     await sleep(800)
   }
 

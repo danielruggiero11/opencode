@@ -66,7 +66,7 @@ function createTransport(config: ServiceNowConfig): ShimTransport {
     const tryOnce = async (
       p: string,
       attempt: number,
-    ): Promise<{ text: string; thinking?: string } | "retry" | "empty"> => {
+    ): Promise<{ text: string; thinking?: string } | "retry" | "empty" | "timeout"> => {
       const res = await execute(buildBody(p))
 
       if (!res.ok) {
@@ -85,6 +85,16 @@ function createTransport(config: ServiceNowConfig): ShimTransport {
       // must not be retried or reported as a context/output-limit error.
       if (result.status === "error" || Object.keys(capabilities).length === 0) {
         const message = typeof result.message === "string" ? result.message : JSON.stringify(result)
+
+        // A platform transaction kill (capability timeout or sysrule_quota max_duration)
+        // returns the same shape as a permission/ACL failure: status "error" with an empty
+        // capabilities object. It is distinguishable only by message, and unlike an ACL
+        // failure it is worth retrying — nothing was produced, so there is no partial write.
+        if (message.includes("maximum execution time exceeded") || message.includes("Transaction cancelled")) {
+          log.warn("transaction cancelled by platform timeout", { attempt, message: message.slice(0, 200) })
+          return "timeout"
+        }
+
         log.error("servicenow request rejected", { capabilityId, message: message.slice(0, 300) })
         throw new APICallError({
           message: `ServiceNow rejected the request for capability ${capabilityId}: ${message}`,
@@ -145,34 +155,46 @@ function createTransport(config: ServiceNowConfig): ShimTransport {
       return { ...first, requestBody: buildBody(prompt) }
     }
 
-    // --- Attempt 2: constrained prompt (ask model to output less) ---
+    // A platform timeout is retried with the prompt unchanged and a longer backoff: the
+    // request was killed mid-generation, not rejected for size, so constraining output is
+    // the wrong remedy. Empty/transient failures still get the output constraint.
     const constrainedPrompt =
       prompt +
       "you are trying to do too much at once. you need to limit your output tokens and give me just the next action to take"
 
-    await new Promise((r) => setTimeout(r, 3000))
-    log.info("retrying with output constraint", { attempt: 2, promptLength: constrainedPrompt.length })
-    const second = await tryOnce(constrainedPrompt, 2)
+    const nextPrompt = (previous: "retry" | "empty" | "timeout") =>
+      previous === "timeout" ? prompt : constrainedPrompt
+    const backoffMs = (previous: "retry" | "empty" | "timeout", attempt: number) =>
+      previous === "timeout" ? attempt * 5000 : 3000
+
+    // --- Attempt 2 ---
+    await new Promise((r) => setTimeout(r, backoffMs(first, 1)))
+    const secondPrompt = nextPrompt(first)
+    log.info("retrying", { attempt: 2, reason: first, promptLength: secondPrompt.length })
+    const second = await tryOnce(secondPrompt, 2)
     if (typeof second === "object") {
-      return { ...second, requestBody: buildBody(constrainedPrompt) }
+      return { ...second, requestBody: buildBody(secondPrompt) }
     }
 
-    // --- Attempt 3: constrained prompt again ---
-    await new Promise((r) => setTimeout(r, 3000))
-    log.info("retrying with output constraint", { attempt: 3, promptLength: constrainedPrompt.length })
-    const third = await tryOnce(constrainedPrompt, 3)
+    // --- Attempt 3 ---
+    await new Promise((r) => setTimeout(r, backoffMs(second, 2)))
+    const thirdPrompt = nextPrompt(second)
+    log.info("retrying", { attempt: 3, reason: second, promptLength: thirdPrompt.length })
+    const third = await tryOnce(thirdPrompt, 3)
     if (typeof third === "object") {
-      return { ...third, requestBody: buildBody(constrainedPrompt) }
+      return { ...third, requestBody: buildBody(thirdPrompt) }
     }
 
-    // --- All attempts exhausted — hard error (no compaction, issue is output size) ---
+    // --- All attempts exhausted — hard error (no compaction; retrying is all we can do) ---
     log.error("all retry attempts exhausted", {
       totalAttempts: TOTAL_ATTEMPTS,
       promptLength: prompt.length,
       lastResult: third,
     })
     throw new Error(
-      `ServiceNow: all ${TOTAL_ATTEMPTS} attempts failed (empty responses). The model output likely exceeds the platform limit. Check opencode logs for details.`,
+      third === "timeout"
+        ? `ServiceNow: all ${TOTAL_ATTEMPTS} attempts were cancelled by the platform (maximum execution time exceeded). Raise the capability timeout (one_api_service_plan_feature.timeout_sec) and the sysrule_quota catch-all max_duration. See the instance setup runbook.`
+        : `ServiceNow: all ${TOTAL_ATTEMPTS} attempts failed (empty responses). The model output likely exceeds the platform limit. Check opencode logs for details.`,
     )
   }
 }

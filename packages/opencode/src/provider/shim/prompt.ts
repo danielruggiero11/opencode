@@ -31,17 +31,16 @@ function toolsBlock(options: LanguageModelV3CallOptions): string {
 
   return `
 <tool_use_instructions>
-You have access to tools. When you need to call a tool respond with ONLY a valid JSON object — no surrounding text, no markdown fences, no explanation:
+You have access to tools. To call a tool, emit a valid JSON object on its own line — no markdown fences:
 {"type":"tool_call","name":"<tool_name>","id":"<unique_string>","input":<json_object>}
 
 Rules:
-- Output ONLY the raw JSON when calling a tool.
-- One tool call per response.
+- A response that contains no tool call ENDS YOUR TURN. Control returns to the user and you will not be called again until they reply.
+- Therefore never end a response by describing an action you have not taken. If you write "let me read X", "next I'll check Y", or "before wiring these in", the tool call for that action MUST be in the same response.
+- If you have findings to report AND more work to do, include the tool call. Report once the work is actually finished.
+- Prefer emitting only the raw JSON, with no surrounding prose. If you do include a brief summary, put each tool call on its own line after it — the call still executes.
 - After tool results are provided you may call another tool or give your final text answer.
-- CRITICAL: Your entire response must be ONLY the JSON object. Do not include any text before or after it. Do not explain what you are doing. Do not narrate. Just output the JSON.
-- Do NOT explain what you are about to do before calling a tool. No preamble.
-- If you want to communicate with the user, do NOT call a tool — just respond with plain text. Never mix text and a tool call in the same response.
-- You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. ALWAYS maximize use of parallel tool calls — aim for 5-10+ parallel calls whenever there are independent operations. This dramatically reduces round-trips. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially.
+- Batch independent tool calls into a single response. Sequence calls that depend on an earlier result.
 - To make multiple tool calls in one response, output each JSON object on its own line (one per line, no array wrapper):
 {"type":"tool_call","name":"tool_a","id":"id_1","input":{...}}
 {"type":"tool_call","name":"tool_b","id":"id_2","input":{...}}

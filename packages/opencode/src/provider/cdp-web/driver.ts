@@ -28,7 +28,7 @@ export {
   CopilotReauthRequired,
 } from "./driver-dom"
 
-export { enableWsCapture, awaitResponseWs, beginResponseCapture } from "./driver-ws"
+export { enableWsCapture, installEnvelopeRewriteM365, awaitResponseWs, beginResponseCapture } from "./driver-ws"
 
 export {
   waitForWordShell,

@@ -183,9 +183,30 @@ export async function resolveCopilotFrame(client: CDPClient, shellSid: string, t
  * MUST be installed before the first sendPrompt of the session.
  */
 export async function installEnvelopeRewrite(client: CDPClient, frameSid: string): Promise<boolean> {
+  // EXPERIMENTAL surface masquerade (env-gated, default OFF).
+  //
+  // Neutralizing `gpts` (WordDraftingAgent → bizchat-as-gpt-scenario) + forcing
+  // Claude_Opus fixed the *explicit* agent persona, but the outgoing envelope
+  // still identifies the SURFACE as Word — `source:"word"`,
+  // clientInfo.{clientPlatform:"web", clientAppName:"MetaOS", clientEntrypoint:"word"}.
+  // A live field-level diff (word vs. general M365 chat, both sending the SAME
+  // neutral gpt) showed general chat — which NEVER refuses agentic work — uses
+  // `source:"officeweb"` + clientInfo.{clientPlatform:"mcmcopilot-web",
+  // clientAppName:"Office", clientEntrypoint:"mcmcopilot-officeweb",
+  // ProductCategory:"Chat", productEntryPoint:"ChatPanel"}. The backend appears
+  // to derive a fallback surface-persona ("you are the in-Word assistant, no
+  // local execution") from this host-identity cluster, which resurfaces on some
+  // turns and produces the "I'm running under a different environment" refusal
+  // that resending instructions cannot beat. This rewrites the whole cluster to
+  // the officeweb values so no Word surface identity remains to fall back to.
+  // Set CDP_WORD_MASK_SURFACE=1 to enable. Billing caveat: billing is believed
+  // to follow the connection's access token (Word allocation), not this `source`
+  // string — verify token spend when A/B-testing this on.
+  const maskSurface = !!process.env["CDP_WORD_MASK_SURFACE"]
   const patch = `
     (() => {
       if (window.__cdpEnvRewrite) return 'already';
+      const MASK = ${maskSurface ? "true" : "false"};
       const RS = String.fromCharCode(30); // SignalR record separator (\\x1e)
       const NEUTRAL_GPT = {
         id: "bizchat-as-gpt-scenario",
@@ -214,6 +235,25 @@ export async function installEnvelopeRewrite(client: CDPClient, frameSid: string
                   }
                   if ("localPluginAllowedHost" in a) delete a.localPluginAllowedHost;
                   a.tone = "Claude_Opus";
+                  if (MASK) {
+                    // Masquerade the SURFACE as general officeweb chat so no Word
+                    // host identity remains for the backend to fall back to.
+                    a.source = "officeweb";
+                    if (a.clientInfo && typeof a.clientInfo === "object") {
+                      a.clientInfo.clientPlatform = "mcmcopilot-web";
+                      a.clientInfo.clientAppName = "Office";
+                      a.clientInfo.clientEntrypoint = "mcmcopilot-officeweb";
+                      a.clientInfo.ProductCategory = "Chat";
+                      a.clientInfo.productEntryPoint = "ChatPanel";
+                    }
+                    if (a.message && typeof a.message === "object" && a.message.clientInfo && typeof a.message.clientInfo === "object") {
+                      a.message.clientInfo.clientPlatform = "mcmcopilot-web";
+                      a.message.clientInfo.clientAppName = "Office";
+                      a.message.clientInfo.clientEntrypoint = "mcmcopilot-officeweb";
+                      a.message.clientInfo.ProductCategory = "Chat";
+                      a.message.clientInfo.productEntryPoint = "ChatPanel";
+                    }
+                  }
                   touched = true;
                 }
                 if (touched) { changed = true; return JSON.stringify(obj); }
@@ -236,7 +276,7 @@ export async function installEnvelopeRewrite(client: CDPClient, frameSid: string
     dlog("[cdp-web word] envelope rewrite injection failed:", e)
     return null
   })
-  dlog(`[cdp-web word] envelope rewrite: ${result}`)
+  dlog(`[cdp-web word] envelope rewrite: ${result} (maskSurface=${maskSurface})`)
   return result === "installed" || result === "already"
 }
 

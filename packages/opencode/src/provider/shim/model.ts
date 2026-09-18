@@ -82,7 +82,8 @@ export class ShimLanguageModel implements LanguageModelV3 {
     if (parsed.thinking) content.push({ type: "reasoning", text: parsed.thinking })
 
     if (parsed.type === "tool_calls") {
-      outputTokens = countTokens(parsed.calls.map((c) => c.input).join(""))
+      outputTokens = countTokens((parsed.text ?? "") + parsed.calls.map((c) => c.input).join(""))
+      if (parsed.text) content.push({ type: "text", text: parsed.text })
       for (const call of parsed.calls) {
         content.push({
           type: "tool-call",
@@ -147,6 +148,11 @@ export class ShimLanguageModel implements LanguageModelV3 {
         }
 
         if (parsed.type === "tool_calls") {
+          if (parsed.text) {
+            controller.enqueue({ type: "text-start", id: "txt-0" })
+            controller.enqueue({ type: "text-delta", id: "txt-0", delta: parsed.text })
+            controller.enqueue({ type: "text-end", id: "txt-0" })
+          }
           for (const call of parsed.calls) {
             controller.enqueue({ type: "tool-input-start", id: call.id, toolName: call.name })
             controller.enqueue({ type: "tool-input-delta", id: call.id, delta: call.input })

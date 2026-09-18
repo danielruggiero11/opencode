@@ -9,7 +9,14 @@
 export type ToolCall = { readonly name: string; readonly id: string; readonly input: string }
 export type ParsedResponse =
   | { readonly type: "text"; readonly text: string; readonly thinking?: string }
-  | { readonly type: "tool_calls"; readonly calls: readonly ToolCall[]; readonly thinking?: string }
+  | {
+      readonly type: "tool_calls"
+      readonly calls: readonly ToolCall[]
+      readonly thinking?: string
+      // Prose the model emitted before its first tool call. Preserved so a
+      // response that both reports findings and acts does not lose the report.
+      readonly text?: string
+    }
 
 // Attempts to parse a string as a single tool-call JSON object. Handles
 // markdown code fences and both canonical and GPT-5 variant formats.
@@ -118,10 +125,21 @@ export function parseResponse(raw: string, thinking?: string): ParsedResponse {
   // Also try embedded extraction — handles multiple JSON objects on a single
   // line (e.g. two tool calls separated by space with no newline between them).
   const embeddedCalls = extractEmbeddedToolCalls(raw)
-  if (embeddedCalls.length > calls.length) return { type: "tool_calls", calls: embeddedCalls, thinking }
-  if (calls.length > 0) return { type: "tool_calls", calls, thinking }
+  if (embeddedCalls.length > calls.length)
+    return { type: "tool_calls", calls: embeddedCalls, thinking, text: leadingProse(raw) }
+  if (calls.length > 0) return { type: "tool_calls", calls, thinking, text: leadingProse(raw) }
 
   return { type: "text", text: raw, thinking }
+}
+
+// Returns the prose that precedes the first JSON object in the response, or
+// undefined when the response starts with a tool call. Only the leading span is
+// captured; text interleaved between or trailing after calls is discarded.
+function leadingProse(raw: string): string | undefined {
+  const idx = raw.indexOf("{")
+  if (idx <= 0) return undefined
+  const prose = raw.slice(0, idx).trim()
+  return prose.length > 0 ? prose : undefined
 }
 
 // Scans the full text for JSON objects that look like tool calls but are

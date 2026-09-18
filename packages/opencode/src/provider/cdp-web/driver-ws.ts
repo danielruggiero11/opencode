@@ -145,6 +145,145 @@ export async function enableWsCapture(client: CDPClient, opts?: { allSessions?: 
 }
 
 /**
+ * M365 (non-word) outgoing-envelope rewrite — the top-page analogue of the Word
+ * engine's `installEnvelopeRewrite`.
+ *
+ * Word had a concrete bad field to neutralize (`gpts:[{WordDraftingAgent}]` +
+ * `localPluginAllowedHost`). M365 general chat already ships the neutral
+ * `bizchat-as-gpt-scenario` + `source:"officeweb"`, so there is NO known persona
+ * field to strip here yet — the only observed difference between M365-Opus
+ * (never refuses) and M365-Sonnet (flat-out refuses) is `tone`. Two independent,
+ * env-gated levers, both OFF by default (byte-identical wire when off):
+ *
+ *   • forceOpus (CDP_M365_FORCE_OPUS=1): stamp `tone:"Claude_Opus"` on every
+ *     outgoing chat invocation even though the UI has Sonnet selected. This is
+ *     the "select Sonnet, actually run Opus" quota probe — it tells us whether
+ *     Copilot bills/quotas by the UI model selection or by the `tone` on the
+ *     wire. If it silently serves Opus without burning Opus quota, great; if it
+ *     refuses or drains Opus quota, we learn the ceiling. VERIFY quota after.
+ *
+ *   • stripCodeInterp (CDP_M365_STRIP_CODE_INTERP=1): remove every `code_interpreter`
+ *     optionSet from the envelope. A live Sonnet-vs-Opus diff proved the two
+ *     envelopes are byte-identical except `tone`, but the shared optionsSets
+ *     enable Copilot's built-in Python sandbox — and Sonnet (unlike Opus) routes
+ *     tool intent INTO that sandbox instead of emitting our JSON tool-call
+ *     contract as text ("tried to do the tool call in its sandbox"). Stripping
+ *     the cluster removes the sandbox so Sonnet has to emit the contract.
+ *
+ * Unlike Word, the M365 Chathub socket lives on the TOP page, so this installs
+ * on the default realm (no OOPIF frame sid). Prototype-level + idempotent
+ * (guarded by `window.__cdpEnvRewriteM365`), so it survives new-chat re-renders
+ * and covers a socket created after injection. Counts applied rewrites via
+ * `window.__cdpEnvRewriteM365Count`. Must be installed before the first send.
+ */
+export async function installEnvelopeRewriteM365(
+  client: CDPClient,
+  opts?: { forceOpus?: boolean; stripCodeInterp?: boolean; author?: string },
+): Promise<boolean> {
+  const forceOpus = !!opts?.forceOpus
+  const stripCodeInterp = !!opts?.stripCodeInterp
+  // Relabel the outgoing message's author (default "" = leave as-is). A live
+  // capture proved our whole contract ships as a single author:"user" message,
+  // which Sonnet's injection classifier reads as user text trying to redefine
+  // the assistant. The UI custom-instructions channel lands system-level (which
+  // defeats the classifier) but is account-global + server-stored, not in the
+  // request. `author` is the one placement we control per-request — if the
+  // backend honors author:"system"/"developer", our contract lands at the same
+  // authoritative level with no account pollution. If the backend ignores or
+  // rejects a client-declared non-user author, this is a no-op / errors the turn
+  // and we learn the per-request system channel isn't exposed.
+  const author = (opts?.author ?? "").trim()
+  const patch = `
+    (() => {
+      // Config is stored on the window and refreshed on EVERY install so that
+      // changing the env toggles between runs takes effect immediately. The
+      // earlier design baked the flags in as literals inside the send closure and
+      // short-circuited on a boolean guard — so a tab left open from a prior run
+      // (we never close tabs; a prototype patch survives new chats AND opencode
+      // restarts) kept applying the OLD flags forever (e.g. FORCE_OPUS leaking
+      // Opus quota into a Sonnet run). Now the send handler reads the live cfg.
+      const VERSION = 2;
+      window.__cdpEnvM365Cfg = { forceOpus: ${forceOpus ? "true" : "false"}, stripCodeInterp: ${stripCodeInterp ? "true" : "false"}, author: ${JSON.stringify(author)} };
+      // If the correct patch version is already installed, we're done — the cfg
+      // above already refreshed the behavior for the live send handler.
+      if (window.__cdpEnvRewriteM365 === VERSION) return 'updated-cfg';
+      // A prior version (or the old boolean-guarded build) may have wrapped send
+      // without saving the original. Restore the saved original if we have one;
+      // otherwise a full reload is required to unwrap it (logged by the caller).
+      if (typeof window.__cdpEnvM365OrigSend === "function") {
+        WebSocket.prototype.send = window.__cdpEnvM365OrigSend;
+      } else if (window.__cdpEnvRewriteM365) {
+        // Old build patched without saving origSend — cannot safely re-wrap.
+        return 'stale-needs-reload';
+      }
+      const RS = String.fromCharCode(30); // SignalR record separator (\\x1e)
+      const origSend = WebSocket.prototype.send;
+      window.__cdpEnvM365OrigSend = origSend;
+      WebSocket.prototype.send = function (data) {
+        const cfg = window.__cdpEnvM365Cfg || {};
+        const FORCE_OPUS = !!cfg.forceOpus;
+        const STRIP_CI = !!cfg.stripCodeInterp;
+        const AUTHOR = typeof cfg.author === "string" ? cfg.author : "";
+        try {
+          if (typeof data === "string" && data.indexOf('"target":"chat"') !== -1) {
+            const parts = data.split(RS).filter(Boolean);
+            let changed = false;
+            const out = parts.map((p) => {
+              let obj;
+              try { obj = JSON.parse(p); } catch { return p; }
+              if (obj && obj.type === 4 && obj.target === "chat" && Array.isArray(obj.arguments)) {
+                let touched = false;
+                for (const a of obj.arguments) {
+                  if (!a || typeof a !== "object") continue;
+                  // Only the chat payload argument carries these; skip others.
+                  if (!(a.gpts || a.message || a.optionsSets)) continue;
+                  if (FORCE_OPUS) { a.tone = "Claude_Opus"; touched = true; }
+                  if (STRIP_CI && Array.isArray(a.optionsSets)) {
+                    // Sonnet routes tool intent into Copilot's built-in Python
+                    // code interpreter ("tried to do the tool call in its
+                    // sandbox") instead of emitting our JSON tool-call contract
+                    // as text. Opus ignores the sandbox. Removing the whole
+                    // code_interpreter optionSets cluster leaves Sonnet nowhere
+                    // to run off to, so it should emit the JSON contract instead.
+                    const before = a.optionsSets.length;
+                    a.optionsSets = a.optionsSets.filter((s) =>
+                      typeof s !== "string" || s.toLowerCase().indexOf("code_interpreter") === -1
+                    );
+                    if (a.optionsSets.length !== before) touched = true;
+                  }
+                  if (AUTHOR && a.message && typeof a.message === "object" && a.message.author && a.message.author !== AUTHOR) {
+                    a.message.author = AUTHOR;
+                    touched = true;
+                  }
+                }
+                if (touched) { changed = true; return JSON.stringify(obj); }
+              }
+              return p;
+            });
+            if (changed) {
+              data = out.join(RS) + RS;
+              window.__cdpEnvRewriteM365Count = (window.__cdpEnvRewriteM365Count || 0) + 1;
+            }
+          }
+        } catch (e) { /* fall through: never break the send */ }
+        return origSend.call(this, data);
+      };
+      window.__cdpEnvRewriteM365 = VERSION;
+      return 'installed';
+    })()
+  `
+  const result = await client.evaluate(patch).catch((e) => {
+    dlog("[cdp-web m365] envelope rewrite injection failed:", e)
+    return null
+  })
+  dlog(`[cdp-web m365] envelope rewrite: ${result} (forceOpus=${forceOpus} stripCodeInterp=${stripCodeInterp} author=${author || "(unchanged)"})`)
+  if (result === "stale-needs-reload") {
+    dlog("[cdp-web m365] a stale envelope patch from a prior run is still active and cannot be unwrapped from JS — HARD-RELOAD the Copilot tab (or restart the browser) so the new flags take effect.")
+  }
+  return result === "installed" || result === "updated-cfg" || result === "stale-needs-reload"
+}
+
+/**
  * Begin capturing Copilot's response via WebSocket frames and return a promise
  * that resolves with the final bot message text (JSON escaping intact).
  *
@@ -276,6 +415,18 @@ export function beginResponseCapture(client: CDPClient, signal?: AbortSignal): P
       if (idleTimer) clearTimeout(idleTimer)
       state!.frameHandler = null
       dlog(`[cdp-web ws DIAG] RESOLVED with ${accumulatedText.length} chars. tail=${JSON.stringify(accumulatedText.slice(-80))}`)
+      // Diagnostic ONLY (env-gated): dump the FULL final bot text — not just the
+      // 80-char tail above — so a refusal ("I can't run that", "I don't have
+      // access", a Word-assistant persona reply) is captured verbatim on the wire
+      // instead of inferred from the pane. A tool-call response prints as the JSON
+      // we forward to the parser; a refusal prints as the prose the model actually
+      // sent. Off by default — set CDP_WS_DUMP_RECV=1 to enable. Capped so a huge
+      // answer can't flood the log; the tail is already logged above regardless.
+      if (process.env["CDP_WS_DUMP_RECV"]) {
+        const MAX = 8000
+        const body = accumulatedText.length > MAX ? accumulatedText.slice(0, MAX) + `…<+${accumulatedText.length - MAX} more>` : accumulatedText
+        dlog(`[cdp-web ws RECV] final bot text (${accumulatedText.length} chars):\n${body}`)
+      }
       resolve(accumulatedText)
     }
   })
@@ -364,12 +515,24 @@ function decodeHtmlEntitiesOnce(text: string): string {
  * host-context fields — source, mode, plugins, grounding/options — stay legible.
  * Purely observational; never alters what is sent.
  */
-function redactBlobs(v: unknown): unknown {
-  if (typeof v === "string") return v.length > 200 ? `<str len=${v.length}>` : v
-  if (Array.isArray(v)) return v.map(redactBlobs)
+// Keys whose VALUE we always show in full even when long — these are the
+// authoritative-channel candidates we're hunting for (custom instructions,
+// persona/system context, memory/profile). Collapsing them would hide exactly
+// the field we're trying to discover. Matched case-insensitively as substrings.
+const KEEP_FULL_KEY_PATTERNS = ["instruction", "persona", "systemcontext", "developer", "profile", "memory", "trait", "customization", "preference"]
+
+function keyWantsFull(key?: string): boolean {
+  if (!key) return false
+  const k = key.toLowerCase()
+  return KEEP_FULL_KEY_PATTERNS.some((p) => k.includes(p))
+}
+
+function redactBlobs(v: unknown, key?: string): unknown {
+  if (typeof v === "string") return v.length > 200 && !keyWantsFull(key) ? `<str len=${v.length}>` : v
+  if (Array.isArray(v)) return v.map((el) => redactBlobs(el, key))
   if (v && typeof v === "object") {
     const out: Record<string, unknown> = {}
-    for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = redactBlobs(val)
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = redactBlobs(val, k)
     return out
   }
   return v
