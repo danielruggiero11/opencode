@@ -50,6 +50,30 @@ type Success = typeof Success.Type
 
 const defaultShell = () => (process.platform === "win32" ? (process.env.COMSPEC ?? "cmd.exe") : "/bin/sh")
 
+// Optional Python virtualenv activation for spawned commands.
+//
+// A shell spawned by this tool does NOT inherit a venv that was `activate`d in
+// the user's interactive terminal — activation only mutates that session's
+// PATH. So `python`/`pip`/installed console scripts resolve to the system
+// interpreter unless the command re-activates the venv every time. To make the
+// venv ambient (no activation, no per-command prefixing, portable via env var),
+// set PYTHON_VENV to the venv root; every command then runs with the venv's
+// bin/Scripts on PATH and VIRTUAL_ENV set, exactly as if it were activated.
+//
+// No-op when PYTHON_VENV is unset, so this is inert for non-Python projects.
+const venvEnv = (): Record<string, string | undefined> | undefined => {
+  const root = process.env["PYTHON_VENV"]
+  if (!root) return undefined
+  const win = process.platform === "win32"
+  const binDir = path.join(root, win ? "Scripts" : "bin")
+  const sep = win ? ";" : ":"
+  const currentPath = process.env["PATH"] ?? process.env["Path"] ?? ""
+  return {
+    VIRTUAL_ENV: root,
+    PATH: currentPath ? `${binDir}${sep}${currentPath}` : binDir,
+  }
+}
+
 const compactOutput = (stdout: string, stderr: string) => {
   const output = stdout && stderr ? `${stdout}\n\nstderr:\n${stderr}` : stderr ? `stderr:\n${stderr}` : stdout
   return output || "(no output)"
@@ -141,12 +165,16 @@ export const layer = Layer.effectDiscard(
             const shell =
               Object.assign({}, ...entries.flatMap((entry) => (entry.type === "document" ? [entry.info] : []))).shell ??
               defaultShell()
+            const extraEnv = venvEnv()
             const command = ChildProcess.make(parameters.command, [], {
               cwd: target.canonical,
               shell,
               stdin: "ignore",
               detached: process.platform !== "win32",
               forceKillAfter: Duration.seconds(3),
+              // Merge over process.env (extendEnv) so the venv wins on PATH while
+              // everything else the host process exposes is preserved.
+              ...(extraEnv ? { env: extraEnv, extendEnv: true } : {}),
             })
             const timeout = parameters.timeout ?? DEFAULT_TIMEOUT_MS
             const result = yield* appProcess

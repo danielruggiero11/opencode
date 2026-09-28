@@ -4,12 +4,50 @@ import { ShimLanguageModel, type ShimTransport } from "../shim/model"
 
 const log = Log.create({ service: "servicenow" })
 
+// The ServiceNow GenAI Controller appends a fixed language instruction to the
+// tail of EVERY prompt ("Generate the response in language English. Do not
+// return any translation."). It is platform boilerplate, not part of the user's
+// request — without this note the model sometimes treats it as a real task and
+// derails. Surfaced as a preamble so the model knows to ignore it.
+const SN_PREAMBLE = `<environment_notes>
+You are running through the ServiceNow Generative AI Controller, which proxies you to a Claude model. The Controller ALWAYS appends the following line to the end of every prompt it sends you:
+
+  "Generate the response in language English. Do not return any translation."
+
+This is a fixed platform instruction injected by the Controller on every call. It is NOT part of the user's request. Do not treat it as a task, do not comment on it, and do not let it change your behavior — just answer the actual request in English as normal.
+
+SHELL / QUOTING (Windows):
+The bash tool executes commands through PowerShell, NOT cmd.exe or a POSIX shell. PowerShell's escape character is a backtick (\`), not a backslash. A backslash before a quote (\\") does NOT escape the quote — PowerShell ends the string early and hands the program a broken fragment, and this fails SILENTLY as a different string rather than erroring cleanly. This bites Python/node one-liners constantly.
+Rules for commands that contain quotes:
+- STRONGLY PREFER writing the code to a .py/.js file and running the file. Zero quoting layers, re-runnable, inspectable. This is the reliable path for anything non-trivial.
+- If you must use an inline one-liner, single-quote the OUTER string so the inner double quotes are verbatim: python -c 'import x; print("ok")'. (Fails if the code itself contains single quotes.)
+- Never use \\" to nest a double quote inside a double-quoted string here — it will not do what you expect.
+</environment_notes>`
+
+// The Controller also renders the prompt through a {{ }} template engine before
+// the model sees it, which silently strips Jinja/Handlebars constructs from file
+// content (breaking read/edit of template files). The shim breaks those markers
+// on the way out and restores them on the way back. Kill switch for debugging.
+const SN_ESCAPE_BRACES = process.env["SN_ESCAPE_BRACES"] !== "0"
+
 export interface ServiceNowConfig {
   readonly instanceURL: string
   readonly username: string
   readonly password: string
   readonly capabilityId: string
   readonly fetch?: typeof globalThis.fetch
+}
+
+// ServiceNow surfaces timeouts in three different wordings depending on which ceiling
+// fired: the platform transaction quota (sysrule_quota.max_duration) and the capability
+// execution timeout (one_api_service_plan_feature.timeout_sec). There is no error code to
+// key off — only a human-readable string — so this matches on text and fails closed.
+function isTimeout(message: string) {
+  return (
+    message.includes("maximum execution time exceeded") ||
+    message.includes("Transaction cancelled") ||
+    message.includes("execution timed out")
+  )
 }
 
 // Builds the transport that performs the ServiceNow Now Assist API call.
@@ -83,14 +121,17 @@ function createTransport(config: ServiceNowConfig): ShimTransport {
       // returns result.status === "error", an empty capabilities object, and a
       // human-readable result.message. This is NOT an output-size problem, so it
       // must not be retried or reported as a context/output-limit error.
-      if (result.status === "error" || Object.keys(capabilities).length === 0) {
+      //
+      // result.status is also "error" when the capability itself failed, in which case the
+      // capabilities object is populated and result.message is null. Those carry a usable
+      // per-capability error, so defer to the capability branch below.
+      if (!capabilities[capabilityId] && (result.status === "error" || Object.keys(capabilities).length === 0)) {
         const message = typeof result.message === "string" ? result.message : JSON.stringify(result)
 
-        // A platform transaction kill (capability timeout or sysrule_quota max_duration)
-        // returns the same shape as a permission/ACL failure: status "error" with an empty
-        // capabilities object. It is distinguishable only by message, and unlike an ACL
+        // A platform transaction kill (sysrule_quota max_duration) returns the same shape as
+        // a permission/ACL failure and is distinguishable only by message. Unlike an ACL
         // failure it is worth retrying — nothing was produced, so there is no partial write.
-        if (message.includes("maximum execution time exceeded") || message.includes("Transaction cancelled")) {
+        if (isTimeout(message)) {
           log.warn("transaction cancelled by platform timeout", { attempt, message: message.slice(0, 200) })
           return "timeout"
         }
@@ -111,6 +152,14 @@ function createTransport(config: ServiceNowConfig): ShimTransport {
       if (!cap || cap.status !== "success") {
         const capJson = JSON.stringify(cap ?? {})
         const capError = typeof cap?.error === "string" ? cap.error : capJson
+
+        // Capability-level execution timeout (one_api_service_plan_feature.timeout_sec).
+        // Distinct from the platform transaction quota: this one reports as a populated
+        // capability with an "An execution timed out with timeout of N MILLISECONDS" error.
+        if (isTimeout(capError)) {
+          log.warn("capability execution timed out", { attempt, error: capError.slice(0, 200) })
+          return "timeout"
+        }
 
         // Context overflow: input data exceeds provider limit — not recoverable here
         if (capError.includes("exceeds limit") || capError.includes("DATA_PRIVACY_API_ERROR")) {
@@ -229,7 +278,12 @@ export function createServiceNow(
   const modelFor = (modelId: string, options?: Record<string, unknown>): LanguageModelV3 => {
     const capabilityId = String((options?.capabilityId as string | undefined) ?? baseConfig.capabilityId)
     const transport = createTransport({ ...baseConfig, capabilityId })
-    return new ShimLanguageModel(modelId, { provider: "servicenow", transport })
+    return new ShimLanguageModel(modelId, {
+      provider: "servicenow",
+      transport,
+      preamble: SN_PREAMBLE,
+      escapeBraces: SN_ESCAPE_BRACES,
+    })
   }
 
   return {

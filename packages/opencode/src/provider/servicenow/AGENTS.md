@@ -25,8 +25,14 @@ like client bugs:
 - **There are two independent timeout ceilings**, both currently `900` s:
   `one_api_service_plan_feature.timeout_sec` (capability) and the `sysrule_quota`
   catch-all `max_duration` (platform transaction). Whichever is lower wins.
-- **A quota kill is indistinguishable from an ACL failure** in the response shape, so it
-  is separated by message match and routed into the retry ladder (see below).
+- **A skill can have more than one plan-feature record.** Match the `planId` in the error
+  payload against `one_api_service_plan_feature.service_plan` to find the one that
+  actually fired; raising a same-named sibling record does nothing.
+- **The two ceilings report differently.** A quota kill arrives as a top-level rejection
+  indistinguishable from an ACL failure. A capability timeout arrives as a *populated*
+  capability with `An execution timed out with timeout of N MILLISECONDS` and a null
+  `result.message`. Both are separated by message match in `isTimeout` and routed into the
+  retry ladder.
 
 ## Boundaries
 

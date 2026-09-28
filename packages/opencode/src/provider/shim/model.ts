@@ -10,6 +10,7 @@ import {
 import { countTokens } from "./tokenizer"
 import { buildPrompt } from "./prompt"
 import { parseResponse } from "./parse"
+import { deTemplateBraces, stripZeroWidth } from "./braces"
 
 // A transport performs the actual network call for a backend. It receives the
 // fully serialized prompt and the model id (so it can later select a backend
@@ -25,6 +26,12 @@ export interface ShimModelConfig {
   // Provider id — used for the `provider` field and providerMetadata key.
   readonly provider: string
   readonly transport: ShimTransport
+  // Provider-specific text prepended to every prompt (backend quirk notes).
+  readonly preamble?: string
+  // When true, break {{ }}/{% %}/{# #} template markers on the way out and undo
+  // them on the way back — for backends that run the prompt through a template
+  // engine that would otherwise consume those constructs (ServiceNow Now Assist).
+  readonly escapeBraces?: boolean
 }
 
 // Shared LanguageModelV3 implementation for text-in / text-out backends that
@@ -40,11 +47,29 @@ export class ShimLanguageModel implements LanguageModelV3 {
   readonly supportedUrls = {} as const
 
   private readonly transport: ShimTransport
+  private readonly preamble?: string
+  private readonly escapeBraces: boolean
 
   constructor(modelId: string, config: ShimModelConfig) {
     this.modelId = modelId
     this.provider = config.provider
     this.transport = config.transport
+    this.preamble = config.preamble
+    this.escapeBraces = config.escapeBraces ?? false
+  }
+
+  // Serialize the prompt, applying provider preamble and (optionally) breaking
+  // template markers so a downstream {{ }} engine leaves them intact.
+  private serialize(options: LanguageModelV3CallOptions): string {
+    const prompt = buildPrompt(options, { preamble: this.preamble })
+    return this.escapeBraces ? deTemplateBraces(prompt) : prompt
+  }
+
+  // Undo template-marker breaking (and any stray zero-width chars) before the
+  // response is parsed for tool calls, so edit/write payloads carry real braces.
+  private decode(text: string | undefined): string | undefined {
+    if (text === undefined) return undefined
+    return this.escapeBraces ? stripZeroWidth(text) : text
   }
 
   private metadata(): SharedV3ProviderMetadata {
@@ -64,13 +89,13 @@ export class ShimLanguageModel implements LanguageModelV3 {
     response: { timestamp: Date; modelId: string }
     warnings: SharedV3Warning[]
   }> {
-    const prompt = buildPrompt(options)
+    const prompt = this.serialize(options)
     const { text, thinking, requestBody } = await this.transport({
       prompt,
       modelId: this.modelId,
       signal: options.abortSignal,
     })
-    const parsed = parseResponse(text, thinking)
+    const parsed = parseResponse(this.decode(text)!, this.decode(thinking))
 
     // Estimate token usage since these backends do not return counts
     const inputTokens = countTokens(prompt)
@@ -121,13 +146,13 @@ export class ShimLanguageModel implements LanguageModelV3 {
     request: { body: string }
     response: { headers: Record<string, string> }
   }> {
-    const prompt = buildPrompt(options)
+    const prompt = this.serialize(options)
     const { text, thinking, requestBody } = await this.transport({
       prompt,
       modelId: this.modelId,
       signal: options.abortSignal,
     })
-    const parsed = parseResponse(text, thinking)
+    const parsed = parseResponse(this.decode(text)!, this.decode(thinking))
     const warnings: SharedV3Warning[] = []
     const providerMetadata = this.metadata()
 

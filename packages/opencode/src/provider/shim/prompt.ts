@@ -53,9 +53,15 @@ ${JSON.stringify(defs, null, 2)}
 
 // Builds the full prompt string the backend receives. Packs the system message,
 // tool block, and full conversation history into one string.
-export function buildPrompt(options: LanguageModelV3CallOptions): string {
+//
+// `preamble` (optional) is provider-specific text prepended ahead of everything
+// else — used to explain backend quirks the model would otherwise misread (e.g.
+// ServiceNow's GenAI Controller appending a fixed language instruction).
+export function buildPrompt(options: LanguageModelV3CallOptions, opts?: { preamble?: string }): string {
   const sections: string[] = []
   const turns: string[] = []
+
+  if (opts?.preamble) sections.push(opts.preamble)
 
   const toolBlock = toolsBlock(options)
 
